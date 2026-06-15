@@ -215,17 +215,26 @@ fn find_similar(
         let counter = AtomicUsize::new(0);
         let total = to_hash.len();
 
-        let results: Vec<(usize, Option<u64>)> = to_hash
-            .par_iter()
-            .map(|&i| {
-                let h = hash_fn(&files[i]);
-                let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
-                if done % 50 == 0 || done == total {
-                    eprint!("\r  Hashed {}/{} files", done, total);
-                }
-                (i, h)
-            })
-            .collect();
+        // Create a custom thread pool for I/O bound network requests to the NAS.
+        // The default pool is limited to CPU cores (e.g., 8), which is too few for network latency.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(64)
+            .build()
+            .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
+
+        let results: Vec<(usize, Option<u64>)> = pool.install(|| {
+            to_hash
+                .par_iter()
+                .map(|&i| {
+                    let h = hash_fn(&files[i]);
+                    let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done % 50 == 0 || done == total {
+                        eprint!("\r  Hashed {}/{} files", done, total);
+                    }
+                    (i, h)
+                })
+                .collect()
+        });
         eprintln!();
 
         for (i, h) in results {
