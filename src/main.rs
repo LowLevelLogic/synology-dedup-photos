@@ -134,7 +134,7 @@ fn compute_dhash_local(path: &Path) -> Option<u64> {
 }
 
 fn compute_dhash_nas(session: &nas::NasClient, nas_path: &str) -> Option<u64> {
-    let (_, bytes) = session.thumbnail_bytes(nas_path)?;
+    let (_, bytes) = session.thumbnail_bytes(nas_path, "small")?;
     compute_dhash_from_bytes(&bytes)
 }
 
