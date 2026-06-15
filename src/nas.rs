@@ -292,9 +292,7 @@ impl NasClient {
         Ok(format!("{:x}", hasher.finalize()))
     }
 
-    /// Fetch a thumbnail from the NAS and return raw bytes,
-    /// or `None` if the thumbnail is unavailable.
-    pub fn thumbnail_bytes(&self, nas_path: &str) -> Option<(String, Vec<u8>)> {
+    pub fn thumbnail_bytes(&self, nas_path: &str, size: &str) -> Option<(String, Vec<u8>)> {
         let url = format!("{}/webapi/entry.cgi", self.base_url);
         let resp = self
             .client
@@ -305,7 +303,7 @@ impl NasClient {
                 ("version", "2"),
                 ("method", "get"),
                 ("path", nas_path),
-                ("size", "large"),
+                ("size", size),
                 ("_sid", &self.sid),
             ])
             .send()
@@ -336,7 +334,7 @@ impl NasClient {
     /// Fetch a thumbnail from the NAS and return a base64 data URI,
     /// or `None` if the thumbnail is unavailable.
     pub fn thumbnail_data_uri(&self, nas_path: &str) -> Option<String> {
-        self.thumbnail_bytes(nas_path).map(|(ct, bytes)| {
+        self.thumbnail_bytes(nas_path, "large").map(|(ct, bytes)| {
             format!("data:{};base64,{}", ct, general_purpose::STANDARD.encode(&bytes))
         })
     }
