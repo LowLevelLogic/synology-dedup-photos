@@ -1,0 +1,16 @@
+[package]
+name = "dedupPictures"
+version = "0.2.0"
+edition = "2024"
+
+[dependencies]
+walkdir = "2"
+sha2 = "0.10"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rpassword = "7"
+base64 = "0.22"
+image = "0.25.10"
+tiny_http = "0.12.0"
+rayon = "1.12.0"
