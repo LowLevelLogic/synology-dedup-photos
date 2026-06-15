@@ -348,14 +348,16 @@ impl NasClient {
         let url = format!("{}/webapi/entry.cgi", self.base_url);
         let paths_json = serde_json::to_string(paths).unwrap_or_default();
 
-        let resp: DsmResp<serde_json::Value> = match self
+        let start: DsmResp<serde_json::Value> = match self
             .client
             .post(&url)
             .form(&[
                 ("api", "SYNO.FileStation.Delete"),
                 ("version", "2"),
-                ("method", "delete"),
+                ("method", "start"),
                 ("path", &paths_json),
+                ("force", "true"),
+                ("recursive", "true"),
                 ("_sid", &self.sid),
             ])
             .send()
@@ -371,16 +373,54 @@ impl NasClient {
             }
         };
 
-        if !resp.success {
+        if !start.success {
             let msg = format!(
-                "Delete failed (DSM code {})",
-                resp.error.as_ref().map(|e| e.code).unwrap_or(0)
+                "Delete start failed (DSM code {})",
+                start.error.as_ref().map(|e| e.code).unwrap_or(0)
             );
             for p in paths {
                 errors.push((p.to_string(), msg.clone()));
             }
+            return errors;
         }
 
+        let taskid = match start.data.and_then(|d| d.get("taskid").and_then(|v| v.as_str()).map(|s| s.to_string())) {
+            Some(t) => t,
+            None => {
+                for p in paths {
+                    errors.push((p.to_string(), "No taskid returned".into()));
+                }
+                return errors;
+            }
+        };
+
+        // Poll until the task finishes (up to ~60 s)
+        for _ in 0..120 {
+            std::thread::sleep(Duration::from_millis(500));
+
+            let status: Result<DsmResp<serde_json::Value>, _> = self
+                .client
+                .get(&url)
+                .query(&[
+                    ("api", "SYNO.FileStation.Delete"),
+                    ("version", "2"),
+                    ("method", "status"),
+                    ("taskid", &taskid),
+                    ("_sid", &self.sid),
+                ])
+                .send()
+                .and_then(|r| r.json());
+
+            if let Ok(s) = status {
+                if s.data.and_then(|d| d.get("finished").and_then(|v| v.as_bool())).unwrap_or(false) {
+                    return errors; // empty = all succeeded
+                }
+            }
+        }
+
+        for p in paths {
+            errors.push((p.to_string(), "Delete task timed out".into()));
+        }
         errors
     }
 
