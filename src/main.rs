@@ -218,7 +218,7 @@ fn find_similar(
         // Create a custom thread pool for I/O bound network requests to the NAS.
         // The default pool is limited to CPU cores (e.g., 8), which is too few for network latency.
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(64)
+            .num_threads(16)
             .build()
             .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
 
