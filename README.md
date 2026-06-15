@@ -8,6 +8,7 @@ It features a beautiful interactive web-based dashboard for reviewing and confir
 
 * **Perceptual Hashing (dHash):** Don't just find exact byte-for-byte duplicates. `dedupPictures` uses perceptual hashing to find photos that *look* the same, even if one was resized, compressed, or sent over WhatsApp.
 * **Synology NAS Native:** Talks directly to the Synology DSM `FileStation` APIs. No need to mount SMB shares or pull terabytes of data over your network. It pulls tiny thumbnails directly from the NAS for blazing fast processing.
+* **MFA / 2FA Support:** Fully supports Synology Secure SignIn / Multi-Factor Authentication. If you don't have MFA enabled on your NAS account, simply hit Enter when prompted—it works seamlessly with or without it.
 * **Interactive Web Dashboard:** Creates a stunning, glassmorphic dark-mode web dashboard on a local server (`http://127.0.0.1:8080`) where you can visually click and toggle which images to Keep or Delete.
 * **Session Persistence & Auto-save:** Accidentally closed the terminal or browser while reviewing thousands of photos? All clicks are auto-saved. Pass `--resume` to pick up exactly where you left off.
 * **Parallel Processing & Caching:** Uses `rayon` to download and hash photos across all your CPU cores. Hashes are permanently cached to `~/.cache/dedupPictures/`, so second runs are nearly instant!
@@ -30,7 +31,7 @@ cargo run --release -- /home/Photos/iPhone_backup \
   --similar \
   --preview
 ```
-*(You will be securely prompted for your DSM Password and 2FA OTP code).*
+*(You will be securely prompted for your DSM Password. If you have 2FA enabled, you will be prompted for your OTP code. If you don't have 2FA enabled, just press Enter to skip).*
 
 ## Flags & Options ⚙️
 
@@ -52,6 +53,6 @@ cargo run --release -- /home/Photos/iPhone_backup \
 |---|---|
 | `--nas-host <IP>` | The NAS IP or Hostname (e.g., `10.0.0.38` or `nas.local:5000`). |
 | `--nas-user <USER>` | Your Synology DSM username. |
-| `--nas-otp <CODE>` | (Optional) Your 6-digit Synology Secure SignIn app code. If omitted, you will be prompted interactively. |
+| `--nas-otp <CODE>` | (Optional) Your 6-digit Synology Secure SignIn app code. If omitted, you will be prompted interactively. If you do not have MFA enabled on your NAS, simply ignore this flag and hit Enter at the interactive prompt. |
 
 *Note: For security, your password is never passed as a flag. The tool will always prompt you interactively.*
