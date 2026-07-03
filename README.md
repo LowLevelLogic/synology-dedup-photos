@@ -87,9 +87,13 @@ Reviewing thousands of photos takes time. If you want to take a break, simply cl
 
 Even if you accidentally force-close your browser or your terminal crashes halfway through, **you won't lose your work!** Every single time you click a photo in the UI, your selections are silently auto-saved to a draft file. 
 
-To pick up exactly where you left off, simply run the exact same command but replace `--preview` with `--resume`:
+To pick up exactly where you left off, simply run the exact same command you used before, but replace `--preview` with `--resume`:
 ```bash
+# Example (Local Mode):
 cargo run --release -- /Users/name/Pictures --resume
+
+# Example (NAS Mode):
+cargo run --release -- /home/Photos/iPhone_backup --nas-host 192.168.1.100 --nas-user myusername --resume
 ```
 This will restore your active session and re-open the browser with all of your customized KEEP/DELETE selections perfectly preserved. 
 
