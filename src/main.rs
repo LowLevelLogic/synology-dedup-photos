@@ -471,6 +471,8 @@ fn generate_html_preview(
   .stats { font-size: 1rem; color: #e2e8f0; }
   .stats span { font-weight: 700; color: #ef4444; }
   .btn { background: linear-gradient(135deg, #ef4444, #b91c1c); color: white; border: none; padding: 0.75rem 2rem; border-radius: 8px; font-weight: 600; font-size: 1rem; cursor: pointer; transition: all 0.2s; box-shadow: 0 4px 6px -1px rgba(239, 68, 68, 0.4); }
+  .btn-cancel { background: #334155; box-shadow: none; }
+  .btn-cancel:hover { background: #475569; transform: translateY(-2px); box-shadow: 0 10px 15px -3px rgba(0,0,0,0.3); }
   .btn:hover { transform: translateY(-2px); box-shadow: 0 10px 15px -3px rgba(239, 68, 68, 0.5); }
   .no-preview { width: 100%; height: 220px; display: flex; align-items: center; justify-content: center; color: #555; font-size: 0.85em; background: #1a1a1a; }
 </style>
@@ -569,7 +571,10 @@ fn generate_html_preview(
         r#"</div>
 <div class="submit-bar" id="submitBar">
   <div class="stats">Ready to delete <span id="delCount">0</span> files &nbsp;&middot;&nbsp; Free up <span id="delSize">0 KB</span></div>
-  <button class="btn" id="submitBtn">Delete Selected Files</button>
+  <div style="display: flex; gap: 1rem;">
+    <button class="btn btn-cancel" id="cancelBtn">Save &amp; Exit</button>
+    <button class="btn" id="submitBtn">Delete Selected Files</button>
+  </div>
 </div>
 
 <script>
@@ -669,6 +674,12 @@ fn generate_html_preview(
     }
   });
 
+  document.getElementById('cancelBtn').addEventListener('click', async () => {
+    document.getElementById('cancelBtn').textContent = 'Exiting...';
+    try { await fetch('/cancel', { method: 'POST' }); } catch(e) {}
+    document.body.innerHTML = '<div style="display:flex;height:100vh;align-items:center;justify-content:center;flex-direction:column;background:#0f172a;color:#f8fafc;font-family:system-ui"><h1>👋 Session Saved</h1><p style="color:#94a3b8;margin-top:1rem">You can safely close this window. Run with --resume to continue.</p></div>';
+  });
+
   document.querySelectorAll('.ts').forEach(el => {
     const d = new Date(parseInt(el.dataset.ts) * 1000);
     el.textContent = 'modified ' + d.toLocaleDateString(undefined, {year:'numeric',month:'short',day:'numeric'});
@@ -729,6 +740,10 @@ fn start_web_server(html: String) -> io::Result<Vec<String>> {
                 let _ = fs::remove_file(cache_dir.join("last_session.html"));
 
                 return Ok(paths);
+            }
+            ("POST", "/cancel") => {
+                let _ = request.respond(tiny_http::Response::from_string("Success"));
+                return Ok(vec![]);
             }
             _ => {
                 let _ = request.respond(tiny_http::Response::from_string("Not Found").with_status_code(404));
