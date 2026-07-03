@@ -91,7 +91,9 @@ To pick up exactly where you left off, simply run the exact same command but rep
 ```bash
 cargo run --release -- /Users/name/Pictures --resume
 ```
-This will restore your active session and re-open the browser with all of your customized KEEP/DELETE selections perfectly preserved.
+This will restore your active session and re-open the browser with all of your customized KEEP/DELETE selections perfectly preserved. 
+
+*(Note: If you want to completely discard your saved session and start over from scratch, simply run the command with the `--clear-cache` flag instead!)*
 
 ## Flags & Options ⚙️
 
