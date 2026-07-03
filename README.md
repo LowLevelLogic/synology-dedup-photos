@@ -77,6 +77,21 @@ cargo run --release -- /home/Photos/iPhone_backup \
 ```
 *(You will be securely prompted for your DSM Password. If you have 2FA enabled, you will be prompted for your OTP code. If you don't have 2FA enabled, just press Enter to skip).*
 
+## The Interactive Web UI 🖥️
+When you run the tool with the `--preview` flag, it instantly spins up a local web server and automatically pops open a glassmorphic dashboard in your default browser. 
+
+In this UI, duplicates are grouped together. The script will automatically pre-select one photo in each group to **KEEP** (usually the highest resolution one) and mark the rest for **DELETE**. You can easily override these selections by clicking on any photo to toggle its status.
+
+**What happens if the browser closes?**
+Reviewing thousands of photos takes time. If you accidentally close your browser, or if your terminal crashes halfway through, **you won't lose your work!**
+Every single time you click a photo in the UI, your selections are silently auto-saved to a draft file. 
+
+To pick up exactly where you left off, simply run the exact same command but replace `--preview` with `--resume`:
+```bash
+cargo run --release -- /Users/name/Pictures --resume
+```
+This will restore your active session and re-open the browser with all of your customized KEEP/DELETE selections perfectly preserved.
+
 ## Flags & Options ⚙️
 
 ### Common Flags
