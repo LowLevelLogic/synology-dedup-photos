@@ -82,9 +82,10 @@ When you run the tool with the `--preview` flag, it instantly spins up a local w
 
 In this UI, duplicates are grouped together. The script will automatically pre-select one photo in each group to **KEEP** (usually the highest resolution one) and mark the rest for **DELETE**. You can easily override these selections by clicking on any photo to toggle its status.
 
-**What happens if the browser closes?**
-Reviewing thousands of photos takes time. If you accidentally close your browser, or if your terminal crashes halfway through, **you won't lose your work!**
-Every single time you click a photo in the UI, your selections are silently auto-saved to a draft file. 
+**How to pause and resume later?**
+Reviewing thousands of photos takes time. If you want to take a break, simply click the **"Save & Exit"** button in the UI. The browser will close your session and the terminal app will gracefully shut down without deleting anything.
+
+Even if you accidentally force-close your browser or your terminal crashes halfway through, **you won't lose your work!** Every single time you click a photo in the UI, your selections are silently auto-saved to a draft file. 
 
 To pick up exactly where you left off, simply run the exact same command but replace `--preview` with `--resume`:
 ```bash
