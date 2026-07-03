@@ -136,6 +136,48 @@ impl NasClient {
         })
     }
 
+    pub fn try_restore_session(base_url: &str, user: &str) -> Option<Self> {
+        let path = crate::dirs().join("nas_session.txt");
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            let parts: Vec<&str> = contents.trim().split('|').collect();
+            if parts.len() == 2 && parts[0] == user {
+                let sid = parts[1].to_string();
+                let client = reqwest::blocking::Client::builder()
+                    .danger_accept_invalid_certs(true)
+                    .timeout(std::time::Duration::from_secs(30))
+                    .build()
+                    .ok()?;
+
+                let session = NasClient {
+                    client,
+                    base_url: base_url.to_string(),
+                    sid: sid.clone(),
+                };
+
+                // Validate the session
+                let url = format!("{}/webapi/entry.cgi", base_url);
+                if let Ok(resp) = session.client.get(&url)
+                    .query(&[
+                        ("api", "SYNO.FileStation.Info"),
+                        ("version", "2"),
+                        ("method", "get"),
+                        ("_sid", &sid),
+                    ])
+                    .send() {
+                    
+                    if let Ok(json) = resp.json::<serde_json::Value>() {
+                        if json.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+                            return Some(session);
+                        }
+                    }
+                }
+                
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        None
+    }
+
     /// List all root shared folders accessible to this user.
     pub fn list_shares(&self) -> Result<Vec<String>, String> {
         let url = format!("{}/webapi/entry.cgi", self.base_url);

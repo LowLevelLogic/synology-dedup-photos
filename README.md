@@ -6,13 +6,27 @@ It features a beautiful interactive web-based dashboard for reviewing and confir
 
 ## Features ✨
 
-* **Perceptual Hashing (dHash):** Don't just find exact byte-for-byte duplicates. `dedupPictures` uses perceptual hashing to find photos that *look* the same, even if one was resized, compressed, or sent over WhatsApp.
+* **127-bit Dual-Gradient Perceptual Hashing:** Don't just find exact byte-for-byte duplicates. `dedupPictures` uses a custom 127-bit perceptual hash (tracking both horizontal and vertical gradients) to find photos that *look* the same, even if one was resized, compressed, or sent over WhatsApp.
 * **Synology NAS Native:** Talks directly to the Synology DSM `FileStation` APIs. No need to mount SMB shares or pull terabytes of data over your network. It pulls tiny thumbnails directly from the NAS for blazing fast processing.
 * **MFA / 2FA Support:** Fully supports Synology Secure SignIn / Multi-Factor Authentication. If you don't have MFA enabled on your NAS account, simply hit Enter when prompted—it works seamlessly with or without it.
 * **Interactive Web Dashboard:** Creates a stunning, glassmorphic dark-mode web dashboard on a local server (`http://127.0.0.1:8080`) where you can visually click and toggle which images to Keep or Delete.
 * **Session Persistence & Auto-save:** Accidentally closed the terminal or browser while reviewing thousands of photos? All clicks are auto-saved. Pass `--resume` to pick up exactly where you left off.
 * **Parallel Processing & Caching:** Uses `rayon` to download and hash photos across all your CPU cores. Hashes are permanently cached to `~/.cache/dedupPictures/`, so second runs are nearly instant!
 * **Dry Run by Default:** It will never delete anything unless you explicitly give it permission via the UI or the `--delete` flag.
+
+## Installation 🛠️
+
+Since `dedupPictures` is built in Rust, you'll need the Rust compiler installed to run it. 
+
+1. **Install Rust:** 
+   Open your terminal and run the official Rust installer (rustup):
+   ```bash
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   ```
+   *(Follow the on-screen prompts and restart your terminal afterwards).*
+
+2. **Run the App:** 
+   Navigate to the project folder and use `cargo run` (this will automatically compile and launch the app in one step).
 
 ## Usage 🚀
 
@@ -39,7 +53,7 @@ cargo run --release -- /home/Photos/iPhone_backup \
 | Flag | Description |
 |---|---|
 | `--similar` | Finds visually similar pictures (using perceptual hashing) instead of exact byte-for-byte duplicates. Highly recommended for photo libraries. |
-| `--threshold <N>` | The Hamming distance threshold for `--similar`. Default is `10` (out of 64 bits). Set lower (e.g. `5`) to be strict, set higher (e.g. `15`) to catch heavier compressions. |
+| `--threshold <N>` | The Hamming distance threshold for `--similar`. Default is `10` (out of 127 bits). Set lower (e.g. `5`) to be extremely strict (exact duplicates/burst shots), set higher (e.g. `20`) to catch heavier compressions and resizes. |
 | `--preview` | Opens the interactive visual web report in your browser for manual review. |
 | `--resume` | Resumes a previous `--preview` session. Picks up your auto-saved KEEP/DELETE selections exactly where you left off. |
 | `--keep <strategy>` | Determines which file in a duplicate group is marked to KEEP by default. Options: `largest` (default, good for keeping original high-res over compressed copies), `newest`, `oldest`. |
