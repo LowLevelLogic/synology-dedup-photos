@@ -111,10 +111,13 @@ fn collect_local_files(root: &str, all_files: bool) -> Vec<FileEntry> {
 
 // ── Perceptual Hashing (dHash) & Similarity ───────────────────────────────────
 
-fn compute_dhash_from_bytes(bytes: &[u8]) -> Option<u64> {
+fn compute_dhash_from_bytes(bytes: &[u8]) -> Option<u128> {
     let img = image::load_from_memory(bytes).ok()?;
-    let gray = img.resize_exact(9, 8, image::imageops::FilterType::Nearest).to_luma8();
-    let mut hash = 0u64;
+    let gray = img.resize_exact(9, 8, image::imageops::FilterType::Lanczos3).to_luma8();
+    
+    let mut hash = 0u128;
+    
+    // 64 bits of horizontal gradients (8x8)
     for y in 0..8 {
         for x in 0..8 {
             let left = gray.get_pixel(x, y)[0];
@@ -125,20 +128,33 @@ fn compute_dhash_from_bytes(bytes: &[u8]) -> Option<u64> {
             }
         }
     }
+    
+    // 63 bits of vertical gradients (9 columns x 7 rows)
+    for x in 0..9 {
+        for y in 0..7 {
+            let top = gray.get_pixel(x, y)[0];
+            let bottom = gray.get_pixel(x, y + 1)[0];
+            hash <<= 1;
+            if top > bottom {
+                hash |= 1;
+            }
+        }
+    }
+    
     Some(hash)
 }
 
-fn compute_dhash_local(path: &Path) -> Option<u64> {
-    let bytes = std::fs::read(path).ok()?;
+fn compute_dhash_local(path: &Path) -> Option<u128> {
+    let bytes = fs::read(path).ok()?;
     compute_dhash_from_bytes(&bytes)
 }
 
-fn compute_dhash_nas(session: &nas::NasClient, nas_path: &str) -> Option<u64> {
+fn compute_dhash_nas(session: &nas::NasClient, nas_path: &str) -> Option<u128> {
     let (_, bytes) = session.thumbnail_bytes(nas_path, "small")?;
     compute_dhash_from_bytes(&bytes)
 }
 
-fn hamming_distance(a: u64, b: u64) -> u32 {
+fn hamming_distance(a: u128, b: u128) -> u32 {
     (a ^ b).count_ones()
 }
 
@@ -147,51 +163,18 @@ fn hamming_distance(a: u64, b: u64) -> u32 {
 const DEFAULT_THRESHOLD: u32 = 10;
 
 /// Union-Find data structure for clustering similar images.
-struct UnionFind {
-    parent: Vec<usize>,
-    rank: Vec<usize>,
-}
 
-impl UnionFind {
-    fn new(n: usize) -> Self {
-        UnionFind {
-            parent: (0..n).collect(),
-            rank: vec![0; n],
-        }
-    }
-
-    fn find(&mut self, x: usize) -> usize {
-        if self.parent[x] != x {
-            self.parent[x] = self.find(self.parent[x]);
-        }
-        self.parent[x]
-    }
-
-    fn union(&mut self, a: usize, b: usize) {
-        let ra = self.find(a);
-        let rb = self.find(b);
-        if ra == rb { return; }
-        if self.rank[ra] < self.rank[rb] {
-            self.parent[ra] = rb;
-        } else if self.rank[ra] > self.rank[rb] {
-            self.parent[rb] = ra;
-        } else {
-            self.parent[rb] = ra;
-            self.rank[ra] += 1;
-        }
-    }
-}
 
 fn find_similar(
     files: Vec<FileEntry>,
-    hash_fn: impl Fn(&FileEntry) -> Option<u64> + Sync,
+    hash_fn: impl Fn(&FileEntry) -> Option<u128> + Sync,
     threshold: u32,
 ) -> (Vec<Vec<FileEntry>>, usize) {
     let n = files.len();
 
     // ── Load cache ──────────────────────────────────────────────────────────
     let mut cache = HashCache::load();
-    let mut hashes: Vec<Option<u64>> = vec![None; n];
+    let mut hashes: Vec<Option<u128>> = vec![None; n];
     let mut to_hash: Vec<usize> = Vec::new();
     let mut cached_count = 0usize;
 
@@ -222,7 +205,7 @@ fn find_similar(
             .build()
             .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
 
-        let results: Vec<(usize, Option<u64>)> = pool.install(|| {
+        let results: Vec<(usize, Option<u128>)> = pool.install(|| {
             to_hash
                 .par_iter()
                 .map(|&i| {
@@ -249,36 +232,43 @@ fn find_similar(
         println!("  Cache saved ({} total entries)", cache.len());
     }
 
-    // ── Compare all pairs and union similar ones ────────────────────────────
-    println!("Comparing all pairs (threshold = {} bits)...", threshold);
-    let mut uf = UnionFind::new(n);
+    // ── Compare all pairs using Greedy Clustering (stops chaining) ─────────────
+    println!("Clustering images (threshold = {} bits)...", threshold);
+    
+    let mut group_indices: Vec<Vec<usize>> = Vec::new();
+    let mut assigned = vec![false; n];
+
     for i in 0..n {
+        if assigned[i] { continue; }
         let h1 = match hashes[i] {
             Some(h) => h,
             None => continue,
         };
+
+        let mut current_group = vec![i];
+        assigned[i] = true;
+
         for j in (i + 1)..n {
+            if assigned[j] { continue; }
             let h2 = match hashes[j] {
                 Some(h) => h,
                 None => continue,
             };
+
+            // Compare strictly to the representative image (h1) to prevent chaining
             if hamming_distance(h1, h2) <= threshold {
-                uf.union(i, j);
+                current_group.push(j);
+                assigned[j] = true;
             }
+        }
+
+        if current_group.len() > 1 {
+            group_indices.push(current_group);
         }
     }
 
-    // ── Collect groups from union-find ───────────────────────────────────────
-    let mut group_map: HashMap<usize, Vec<usize>> = HashMap::new();
-    for i in 0..n {
-        if hashes[i].is_none() { continue; }
-        let root = uf.find(i);
-        group_map.entry(root).or_default().push(i);
-    }
-
-    let groups: Vec<Vec<FileEntry>> = group_map
-        .into_values()
-        .filter(|indices| indices.len() > 1)
+    let groups: Vec<Vec<FileEntry>> = group_indices
+        .into_iter()
         .map(|indices| indices.into_iter().map(|i| files[i].clone()).collect())
         .collect();
 
@@ -290,7 +280,7 @@ fn find_similar(
 
 struct HashCache {
     path: PathBuf,
-    entries: HashMap<String, u64>,
+    entries: HashMap<String, u128>,
 }
 
 impl HashCache {
@@ -312,11 +302,11 @@ impl HashCache {
         format!("{}:{}:{}", entry.display_path, entry.size, entry.mtime)
     }
 
-    fn get(&self, entry: &FileEntry) -> Option<u64> {
+    fn get(&self, entry: &FileEntry) -> Option<u128> {
         self.entries.get(&Self::cache_key(entry)).copied()
     }
 
-    fn insert(&mut self, entry: &FileEntry, hash: u64) {
+    fn insert(&mut self, entry: &FileEntry, hash: u128) {
         self.entries.insert(Self::cache_key(entry), hash);
     }
 
@@ -334,7 +324,7 @@ impl HashCache {
     }
 }
 
-fn dirs() -> PathBuf {
+pub fn dirs() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join(".cache").join("dedupPictures")
 }
@@ -641,6 +631,24 @@ fn generate_html_preview(
   }).catch(() => {});
 
   document.getElementById('submitBtn').addEventListener('click', async () => {
+    // Safety check: Ensure no group has 0 "KEEP" cards
+    const groups = document.querySelectorAll('.group');
+    for (let i = 0; i < groups.length; i++) {
+      const group = groups[i];
+      const keepCards = group.querySelectorAll('.card.keep');
+      if (keepCards.length === 0) {
+        const title = group.querySelector('.group-title').textContent.split('(')[0].trim();
+        alert(`🚨 Safety Check Failed:\n\n${title} has NO pictures selected to keep (all photos are marked for deletion).\n\nPlease click one of the photos in that group to mark it as 'KEEP' before proceeding.`);
+        
+        // Scroll the problematic group into view and flash it
+        group.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        const originalBg = group.style.backgroundColor;
+        group.style.backgroundColor = 'rgba(239, 68, 68, 0.2)';
+        setTimeout(() => { group.style.backgroundColor = originalBg; }, 2000);
+        return;
+      }
+    }
+
     const toDelete = Array.from(document.querySelectorAll('.card.del')).map(c => c.dataset.path);
     if (!confirm(`Are you absolutely sure you want to permanently delete ${toDelete.length} files? This cannot be undone.`)) return;
     
@@ -977,30 +985,39 @@ fn run_nas(
         }
     };
 
-    let password = rpassword::prompt_password("NAS password: ")
-        .expect("Failed to read password");
+    let mut session_opt = nas::NasClient::try_restore_session(&base_url, &user);
+    if session_opt.is_none() {
+        let password = rpassword::prompt_password("NAS password: ")
+            .expect("Failed to read password");
 
-    let otp = match nas_otp_flag {
-        Some(o) => o,
-        None => {
-            eprint!("OTP code (from Synology Secure SignIn app, or Enter to skip): ");
-            io::stderr().flush().ok();
-            let mut o = String::new();
-            io::stdin().read_line(&mut o).expect("Failed to read OTP");
-            o.trim().to_string()
-        }
-    };
+        let otp = match nas_otp_flag {
+            Some(o) => o,
+            None => {
+                eprint!("OTP code (from Synology Secure SignIn app, or Enter to skip): ");
+                io::stderr().flush().ok();
+                let mut o = String::new();
+                io::stdin().read_line(&mut o).expect("Failed to read OTP");
+                o.trim().to_string()
+            }
+        };
 
-    println!();
-    println!("Connecting : {}", base_url);
+        println!("\nConnecting : {}", base_url);
+        let s = match nas::NasClient::login(&base_url, &user, &password, &otp) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Authentication failed: {}", e);
+                std::process::exit(1);
+            }
+        };
+        
+        let path = dirs().join("nas_session.txt");
+        let _ = fs::write(&path, format!("{}|{}", user, s.sid));
+        session_opt = Some(s);
+    } else {
+        println!("\nResuming active NAS session for user '{}'...", user);
+    }
 
-    let session = match nas::NasClient::login(&base_url, &user, &password, &otp) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Authentication failed: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let session = session_opt.unwrap();
 
     println!("Authenticated");
     println!();
@@ -1100,7 +1117,8 @@ fn run_nas(
     };
 
     if errors > 0 {
-        eprintln!("  ({} files skipped due to errors)", errors);
+        println!("\n⚠️  Note: {} files were skipped because the NAS could not provide thumbnails for them.", errors);
+        println!("    (This typically happens with massive .DNG or .HEIC files if the NAS hasn't indexed them yet.)");
     }
     if groups.is_empty() {
         println!("\nNo duplicates found.");
