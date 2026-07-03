@@ -1,6 +1,6 @@
 # dedupPictures 📸
 
-A blazingly fast, visually-aware photo deduplication tool built in Rust. It finds exact duplicates or visually similar photos (like WhatsApp-compressed copies) both locally on your machine and remotely over the network on a Synology NAS.
+A blazingly fast, visually-aware photo deduplication tool built in Rust. It finds exact duplicates or visually similar photos (like WhatsApp-compressed copies) both locally on your machine, on generic NAS drives (via network mounts), and via a dedicated ultra-fast API mode for Synology NAS setups.
 
 It features a beautiful interactive web-based dashboard for reviewing and confirming deletions before they happen.
 
@@ -28,15 +28,45 @@ Since `dedupPictures` is built in Rust, you'll need the Rust compiler installed 
 2. **Run the App:** 
    Navigate to the project folder and use `cargo run` (this will automatically compile and launch the app in one step).
 
-## Usage 🚀
+## Understanding the Threshold (127-bit dHash)
 
+`dedupPictures` uses a custom **127-bit Dual-Gradient Perceptual Hash (dHash)**. 
+Unlike standard cryptographic hashes (SHA-256) which change completely if a single pixel is altered, this perceptual hash tracks the physical transitions of light-to-dark (gradients) across the image layout. 
+
+When you specify a `--threshold` flag (default is `10`), you are setting the maximum **Hamming distance** (the number of differing bits) allowed between two hashes for them to be considered duplicates. Because the algorithm checks if the difference is *less than or equal to* the threshold, it will always catch mathematically exact copies regardless of what you set the threshold to.
+
+- **`--threshold 0`**: Requires exact identical gradients. (Use for finding exact, mathematically identical, uncompressed copies).
+- **`--threshold 10` (Recommended & Default)**: Catches everything up to an ~8% variance (0 to 10 differing bits). This is the sweet spot! It finds all of your mathematically exact copies, while also catching WhatsApp compressions, minor resolution drops, and subtle burst-shot variations.
+- **`--threshold 20+`**: Very loose. Use with caution, as it may begin to group visually similar but completely distinct photos (like different photos of the exact same landscape).
+
+## Usage 🚀
 ### Local Mode (Mac / PC)
 Point it at a local directory on your machine:
 ```bash
 cargo run --release -- /Users/name/Pictures --preview
 ```
 
-### NAS Mode (Synology)
+### Generic NAS Mode (QNAP, TrueNAS, Unraid, etc.)
+Because generic network protocols (like WebDAV or SMB) don't have standardized ways to ask the NAS to generate and send tiny thumbnails, building a dedicated network API for them would force the script to download full 10MB+ Raw files over your Wi-Fi, defeating the purpose of a fast network deduplicator. 
+
+Instead, the fastest way to deduplicate a generic NAS is to natively mount it to your computer using SMB or NFS, and run the script in **Local Mode**. The script will seamlessly process it over the network mount.
+
+**How to mount your NAS:**
+- **macOS:** Open Finder, press `Cmd + K` (Connect to Server), enter `smb://<NAS_IP>` (e.g., `smb://192.168.1.100`), and enter your NAS credentials. The drive will mount under `/Volumes/`.
+- **Windows:** Open File Explorer, right-click "This PC", select "Map network drive...", enter `\\<NAS_IP>\<ShareName>`, and enter your NAS credentials. It will map to a drive letter like `Z:`.
+
+Once mounted, simply run the script against the new local path:
+```bash
+# macOS Example:
+cargo run --release -- /Volumes/MyNAS/Photos --preview
+
+# Windows Example:
+cargo run --release -- Z:\Photos --preview
+```
+
+### Dedicated NAS Mode (Synology)
+If you have a Synology NAS, you're in luck! `dedupPictures` has a dedicated mode that talks directly to the Synology DSM `FileStation` APIs. Instead of downloading the original photos, it asks the NAS to generate a tiny 10KB thumbnail on the server side and analyzes that instead, saving gigabytes of network bandwidth!
+
 Point it at a shared folder path on your Synology NAS:
 ```bash
 cargo run --release -- /home/Photos/iPhone_backup \
