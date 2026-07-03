@@ -871,7 +871,11 @@ fn run_local(root: &str, delete: bool, all_files: bool, similar: bool, preview: 
         let html = fs::read_to_string(&session_path).expect("Failed to read saved session");
         println!("Resuming previous session...");
         if let Ok(to_delete) = start_web_server(html) {
-            if to_delete.is_empty() { return; }
+            if to_delete.is_empty() { 
+                println!("\n\x1b[1;32m👋 Session saved! The local web server has been shut down.\x1b[0m");
+                println!("\x1b[1;36mRun the command again with --resume to continue.\x1b[0m");
+                return; 
+            }
             println!("\nDeleting {} files...", to_delete.len());
             let (mut deleted, mut errs) = (0usize, 0usize);
             for path_str in to_delete {
@@ -938,7 +942,8 @@ fn run_local(root: &str, delete: bool, all_files: bool, similar: bool, preview: 
         let html = generate_html_preview(&groups, None);
         if let Ok(to_delete) = start_web_server(html) {
             if to_delete.is_empty() {
-                println!("No files selected for deletion.");
+                println!("\n\x1b[1;32m👋 Session saved! The local web server has been shut down.\x1b[0m");
+                println!("\x1b[1;36mRun the command again with --resume to continue.\x1b[0m");
                 return;
             }
             println!("\nDeleting {} files from UI request...", to_delete.len());
@@ -1048,6 +1053,8 @@ fn run_nas(
         println!("Resuming previous NAS session...");
         if let Ok(to_delete) = start_web_server(html) {
             if to_delete.is_empty() { 
+                println!("\n\x1b[1;32m👋 Session saved! The local web server has been shut down.\x1b[0m");
+                println!("\x1b[1;36mRun the command again with --resume to continue.\x1b[0m");
                 session.logout();
                 return; 
             }
@@ -1149,7 +1156,8 @@ fn run_nas(
         let html = generate_html_preview(&groups, Some(&session));
         if let Ok(to_delete) = start_web_server(html) {
             if to_delete.is_empty() {
-                println!("No files selected for deletion.");
+                println!("\n\x1b[1;32m👋 Session saved! The local web server has been shut down.\x1b[0m");
+                println!("\x1b[1;36mRun the command again with --resume to continue.\x1b[0m");
                 session.logout();
                 return;
             }
