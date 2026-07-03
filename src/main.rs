@@ -873,7 +873,7 @@ fn run_local(root: &str, delete: bool, all_files: bool, similar: bool, preview: 
         if let Ok(to_delete) = start_web_server(html) {
             if to_delete.is_empty() { 
                 println!("\n\x1b[1;31m👋 Session saved! The local web server has been shut down.\x1b[0m");
-                println!("\x1b[1;36mRun the command again with --resume to continue.\x1b[0m");
+                println!("\x1b[1;36mUse the --resume flag to restore your session and continue.\x1b[0m");
                 return; 
             }
             println!("\nDeleting {} files...", to_delete.len());
@@ -943,7 +943,7 @@ fn run_local(root: &str, delete: bool, all_files: bool, similar: bool, preview: 
         if let Ok(to_delete) = start_web_server(html) {
             if to_delete.is_empty() {
                 println!("\n\x1b[1;31m👋 Session saved! The local web server has been shut down.\x1b[0m");
-                println!("\x1b[1;36mRun the command again with --resume to continue.\x1b[0m");
+                println!("\x1b[1;36mUse the --resume flag to restore your session and continue.\x1b[0m");
                 return;
             }
             println!("\nDeleting {} files from UI request...", to_delete.len());
@@ -1054,7 +1054,7 @@ fn run_nas(
         if let Ok(to_delete) = start_web_server(html) {
             if to_delete.is_empty() { 
                 println!("\n\x1b[1;31m👋 Session saved! The local web server has been shut down.\x1b[0m");
-                println!("\x1b[1;36mRun the command again with --resume to continue.\x1b[0m");
+                println!("\x1b[1;36mUse the --resume flag to restore your session and continue.\x1b[0m");
                 return; 
             }
             println!("\nDeleting {} files from NAS via UI request...", to_delete.len());
