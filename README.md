@@ -9,7 +9,7 @@ It features a beautiful interactive web-based dashboard for reviewing and confir
 * **127-bit Dual-Gradient Perceptual Hashing:** Don't just find exact byte-for-byte duplicates. `dedupPictures` uses a custom 127-bit perceptual hash (tracking both horizontal and vertical gradients) to find photos that *look* the same, even if one was resized, compressed, or sent over WhatsApp.
 * **Synology NAS Native Architecture:** Most standard photo deduplication tools require you to mount your NAS as a network drive (SMB) and will download the *entire* 50MB+ Raw file for every single photo over your Wi-Fi just to analyze it, choking your network and taking hours. `dedupPictures` talks directly to the Synology DSM `FileStation` APIs. Instead of downloading the original photos, it asks the NAS to generate a tiny 10KB thumbnail and analyzes that instead. This allows it to perceptually scan terabytes of network photos in mere seconds.
 * **MFA / 2FA Support:** Fully supports Synology Secure SignIn / Multi-Factor Authentication. If you don't have MFA enabled on your NAS account, simply hit Enter when prompted—it works seamlessly with or without it.
-* **Interactive Web Dashboard:** Creates a stunning, glassmorphic dark-mode web dashboard on a local server (`http://127.0.0.1:8080`) where you can visually click and toggle which images to Keep or Delete.
+* **Interactive Web Dashboard:** Creates a stunning, glassmorphic dark-mode web dashboard on a local server (`http://127.0.0.1:8080` by default; a free port is picked automatically if 8080 is busy) where you can visually click and toggle which images to Keep or Delete. The server is protected by a per-run security token, and it will only ever delete files that were actually shown in the review session.
 * **Session Persistence & Auto-save:** Accidentally closed the terminal or browser while reviewing thousands of photos? All clicks are auto-saved. Pass `--resume` to pick up exactly where you left off.
 * **Parallel Processing & Caching:** Uses `rayon` to download and hash photos across all your CPU cores. Hashes are permanently cached to `~/.cache/dedupPictures/`, so second runs are nearly instant!
 * **Dry Run by Default:** It will never delete anything unless you explicitly give it permission via the UI or the `--delete` flag.
@@ -77,6 +77,8 @@ cargo run --release -- /home/Photos/iPhone_backup \
 ```
 *(You will be securely prompted for your DSM Password. If you have 2FA enabled, you will be prompted for your OTP code. If you don't have 2FA enabled, just press Enter to skip).*
 
+**Note on HTTPS certificates:** TLS certificates are verified by default. Most home NAS setups accessed by IP address use a self-signed certificate, which will fail verification — if you see a connection error, add the `--insecure` flag to skip certificate verification. Only do this on a network you trust (e.g. your home LAN).
+
 ## The Interactive Web UI 🖥️
 When you run the tool with the `--preview` flag, it instantly spins up a local web server and automatically pops open a glassmorphic dashboard in your default browser. 
 
@@ -110,7 +112,7 @@ This will restore your active session and re-open the browser with all of your c
 | `--resume` | Resumes a previous `--preview` session. Picks up your auto-saved KEEP/DELETE selections exactly where you left off. |
 | `--keep <strategy>` | Determines which file in a duplicate group is marked to KEEP by default. Options: `largest` (default, good for keeping original high-res over compressed copies), `newest`, `oldest`. |
 | `--delete` | Runs strictly in the terminal and automatically deletes all files marked as duplicates. Bypasses the UI. |
-| `--clear-cache` | Wipes the perceptual hash cache (`~/.cache/dedupPictures/`) and forces a full re-hash of all files. |
+| `--clear-cache` | Wipes the perceptual hash cache (`~/.cache/dedupPictures/`) and any saved review session, forcing a full re-hash of all files. |
 | `--all-files` | Scans all file types instead of filtering for standard image extensions. (Useful with exact byte-for-byte deduplication). |
 | `--list-shares` | (NAS Only) Queries the NAS and prints out all available root folder paths that your user has permission to scan. |
 
@@ -120,5 +122,6 @@ This will restore your active session and re-open the browser with all of your c
 | `--nas-host <IP>` | The NAS IP or Hostname (e.g., `10.0.0.38` or `nas.local:5000`). |
 | `--nas-user <USER>` | Your Synology DSM username. |
 | `--nas-otp <CODE>` | (Optional) Your 6-digit Synology Secure SignIn app code. If omitted, you will be prompted interactively. If you do not have MFA enabled on your NAS, simply ignore this flag and hit Enter at the interactive prompt. |
+| `--insecure` | Skips TLS certificate verification. Required if your NAS uses a self-signed HTTPS certificate (common for home setups accessed by IP address). Only use on a trusted network. |
 
 *Note: For security, your password is never passed as a flag. The tool will always prompt you interactively.*

@@ -1,7 +1,7 @@
 mod nas;
 
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -159,13 +159,14 @@ fn hamming_distance(a: u128, b: u128) -> u32 {
 }
 
 /// Default similarity threshold: max Hamming distance between two dHash values
-/// to consider them "similar". 10 out of 64 bits ≈ 15% difference.
+/// to consider them "similar". 10 out of 127 bits ≈ 8% difference.
 const DEFAULT_THRESHOLD: u32 = 10;
 
 /// Union-Find data structure for clustering similar images.
 
 
 fn find_similar(
+    root: &str,
     files: Vec<FileEntry>,
     hash_fn: impl Fn(&FileEntry) -> Option<u128> + Sync,
     threshold: u32,
@@ -174,6 +175,9 @@ fn find_similar(
 
     // ── Load cache ──────────────────────────────────────────────────────────
     let mut cache = HashCache::load();
+    let current_keys: HashSet<String> = files.iter().map(HashCache::cache_key).collect();
+    let pruned = cache.prune(root, &current_keys);
+    let mut dirty = pruned > 0;
     let mut hashes: Vec<Option<u128>> = vec![None; n];
     let mut to_hash: Vec<usize> = Vec::new();
     let mut cached_count = 0usize;
@@ -227,7 +231,10 @@ fn find_similar(
                 cache.insert(&files[i], hash_val);
             }
         }
+        dirty = true;
+    }
 
+    if dirty {
         cache.save();
         println!("  Cache saved ({} total entries)", cache.len());
     }
@@ -308,6 +315,16 @@ impl HashCache {
 
     fn insert(&mut self, entry: &FileEntry, hash: u128) {
         self.entries.insert(Self::cache_key(entry), hash);
+    }
+
+    /// Drop stale entries for files under `root` that no longer exist (or whose
+    /// size/mtime changed) so the cache doesn't grow without bound.
+    fn prune(&mut self, root: &str, current_keys: &HashSet<String>) -> usize {
+        let prefix = format!("{}/", root.trim_end_matches('/'));
+        let before = self.entries.len();
+        self.entries
+            .retain(|k, _| !k.starts_with(&prefix) || current_keys.contains(k));
+        before - self.entries.len()
     }
 
     fn len(&self) -> usize {
@@ -431,11 +448,25 @@ fn print_report(groups: &[Vec<FileEntry>], total_del: usize, total_bytes: u64, d
 
 // ── HTML preview & Interactive UI ─────────────────────────────────────────────
 
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// Placeholder replaced with a per-run CSRF token when the page is served.
+const TOKEN_PLACEHOLDER: &str = "__CSRF_TOKEN__";
+
+/// Returns the page HTML (with token placeholders) plus the list of local
+/// image paths referenced by `/img/<index>` routes.
 fn generate_html_preview(
     groups: &[Vec<FileEntry>],
     nas: Option<&nas::NasClient>,
-) -> String {
+) -> (String, Vec<String>) {
     let mut html = String::new();
+    let mut images: Vec<String> = Vec::new();
 
     html.push_str(
         r#"<!DOCTYPE html>
@@ -512,9 +543,14 @@ fn generate_html_preview(
                 FileSource::Local(path)
                     if crate::BROWSER_DISPLAYABLE.contains(&entry.ext.as_str()) =>
                 {
-                    let abs = path.canonicalize().unwrap_or_else(|_| path.clone());
-                    let url = abs.display().to_string().replace(' ', "%20");
-                    format!(r#"<img src="file://{}" alt="" loading="lazy">"#, url)
+                    // Served by the local web server; file:// URLs are blocked
+                    // by browsers on pages loaded over http.
+                    let idx = images.len();
+                    images.push(path.display().to_string());
+                    format!(
+                        r#"<img src="/img/{}?t={}" alt="" loading="lazy">"#,
+                        idx, TOKEN_PLACEHOLDER
+                    )
                 }
                 FileSource::Nas(nas_path) => {
                     if nas.is_some() {
@@ -525,13 +561,13 @@ fn generate_html_preview(
                         Some(uri) => format!(r#"<img src="{}" alt="">"#, uri),
                         None => format!(
                             r#"<div class="no-preview">{} — no preview</div>"#,
-                            entry.ext.to_uppercase()
+                            html_escape(&entry.ext.to_uppercase())
                         ),
                     }
                 }
                 _ => format!(
                     r#"<div class="no-preview">{} — no browser preview</div>"#,
-                    entry.ext.to_uppercase()
+                    html_escape(&entry.ext.to_uppercase())
                 ),
             };
 
@@ -550,11 +586,11 @@ fn generate_html_preview(
   </div>
 "#,
                 card_class,
-                path_for_js,
+                html_escape(&path_for_js),
                 entry.size,
                 media,
                 badge,
-                entry.display_path,
+                html_escape(&entry.display_path),
                 format_size(entry.size),
                 entry.mtime
             ));
@@ -578,6 +614,8 @@ fn generate_html_preview(
 </div>
 
 <script>
+  const TOKEN = "__CSRF_TOKEN__";
+
   function formatSize(bytes) {
     if (bytes >= 1073741824) return (bytes / 1073741824).toFixed(2) + ' GB';
     if (bytes >= 1048576) return (bytes / 1048576).toFixed(2) + ' MB';
@@ -596,7 +634,7 @@ fn generate_html_preview(
 
   function autosave() {
     const toDelete = Array.from(document.querySelectorAll('.card.del')).map(c => c.dataset.path);
-    fetch('/autosave', { method: 'POST', body: JSON.stringify(toDelete) }).catch(() => {});
+    fetch('/autosave', { method: 'POST', headers: { 'X-Auth': TOKEN }, body: JSON.stringify(toDelete) }).catch(() => {});
   }
 
   document.querySelectorAll('.card').forEach(card => {
@@ -618,7 +656,7 @@ fn generate_html_preview(
   updateStats();
 
   // Restore saved draft selections on page load
-  fetch('/draft').then(r => r.json()).then(paths => {
+  fetch('/draft', { headers: { 'X-Auth': TOKEN } }).then(r => r.json()).then(paths => {
     if (!paths || paths.length === 0) return;
     const deleteSet = new Set(paths);
     document.querySelectorAll('.card').forEach(card => {
@@ -661,7 +699,7 @@ fn generate_html_preview(
     document.getElementById('submitBtn').disabled = true;
 
     try {
-      const res = await fetch('/delete', { method: 'POST', body: JSON.stringify(toDelete) });
+      const res = await fetch('/delete', { method: 'POST', headers: { 'X-Auth': TOKEN }, body: JSON.stringify(toDelete) });
       if (res.ok) {
         document.body.innerHTML = '<div style="display:flex;height:100vh;align-items:center;justify-content:center;flex-direction:column;background:#0f172a;color:#f8fafc;font-family:system-ui"><h1>🎉 Deletion Complete!</h1><p style="color:#94a3b8;margin-top:1rem">You can close this window and check your terminal.</p></div>';
       } else {
@@ -676,7 +714,7 @@ fn generate_html_preview(
 
   document.getElementById('cancelBtn').addEventListener('click', async () => {
     document.getElementById('cancelBtn').textContent = 'Exiting...';
-    try { await fetch('/cancel', { method: 'POST' }); } catch(e) {}
+    try { await fetch('/cancel', { method: 'POST', headers: { 'X-Auth': TOKEN } }); } catch(e) {}
     document.body.innerHTML = '<div style="display:flex;height:100vh;align-items:center;justify-content:center;flex-direction:column;background:#0f172a;color:#f8fafc;font-family:system-ui"><h1>👋 Session Saved</h1><p style="color:#94a3b8;margin-top:1rem">You can safely close this window. Run with --resume to continue.</p></div>';
   });
 
@@ -688,60 +726,200 @@ fn generate_html_preview(
 </body></html>
 "#);
 
-    html
+    (html, images)
 }
 
-fn start_web_server(html: String) -> io::Result<Vec<String>> {
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SessionMeta {
+    allowed: Vec<String>,
+    images: Vec<String>,
+}
+
+/// Random per-run token embedded in the served page. Every request that reads
+/// or mutates state must present it, so other webpages open in the browser
+/// cannot forge requests against this server (CSRF/DNS-rebinding protection).
+fn generate_token() -> String {
+    let mut hasher = Sha256::new();
+    if let Ok(mut f) = File::open("/dev/urandom") {
+        let mut buf = [0u8; 32];
+        if f.read_exact(&mut buf).is_ok() {
+            hasher.update(buf);
+        }
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let addr = &now as *const _ as usize; // ASLR entropy for non-unix fallback
+    hasher.update(now.as_nanos().to_le_bytes());
+    hasher.update(std::process::id().to_le_bytes());
+    hasher.update(addr.to_le_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn mime_for_path(path: &str) -> &'static str {
+    match Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("gif") => "image/gif",
+        Some("bmp") => "image/bmp",
+        Some("webp") => "image/webp",
+        _ => "image/jpeg",
+    }
+}
+
+/// `allowed` is the set of paths the server may be asked to delete (everything
+/// shown in the review UI); anything else in a /delete request is rejected.
+/// `images` are the local files served via /img/<index>.
+fn start_web_server(
+    html_template: String,
+    allowed: HashSet<String>,
+    images: Vec<String>,
+) -> io::Result<Vec<String>> {
     let cache_dir = dirs();
     let _ = fs::create_dir_all(&cache_dir);
 
-    // Save session HTML for --resume
-    let _ = fs::write(cache_dir.join("last_session.html"), &html);
+    // Save session (token placeholders intact) for --resume
+    let _ = fs::write(cache_dir.join("last_session.html"), &html_template);
+    let meta = SessionMeta {
+        allowed: allowed.iter().cloned().collect(),
+        images: images.clone(),
+    };
+    if let Ok(json) = serde_json::to_string(&meta) {
+        let _ = fs::write(cache_dir.join("session_meta.json"), json);
+    }
 
-    let server = tiny_http::Server::http("127.0.0.1:8080").map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-    println!("\n🌐 Interactive preview available at: http://127.0.0.1:8080");
+    let token = generate_token();
+    let page = html_template.replace(TOKEN_PLACEHOLDER, &token);
+
+    let (server, port) = match tiny_http::Server::http("127.0.0.1:8080") {
+        Ok(s) => (s, 8080u16),
+        Err(_) => {
+            let s = tiny_http::Server::http("127.0.0.1:0")
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let p = s.server_addr().to_ip().map(|a| a.port()).unwrap_or(0);
+            println!("Port 8080 is busy — using port {} instead.", p);
+            (s, p)
+        }
+    };
+    let url = format!("http://127.0.0.1:{}", port);
+    println!("\n🌐 Interactive preview available at: {}", url);
     println!("Your selections are auto-saved. Use --resume to continue if this process stops.");
-    open_in_browser("http://127.0.0.1:8080");
+    open_in_browser(&url);
 
     let json_header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
     let html_header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap();
 
+    let has_token = |request: &tiny_http::Request| -> bool {
+        request
+            .headers()
+            .iter()
+            .any(|h| h.field.equiv("X-Auth") && h.value.as_str() == token)
+    };
+
+    // DNS-rebinding protection: only answer requests addressed to this host,
+    // so a hostile domain rebound to 127.0.0.1 can't read the page (and token).
+    let allowed_hosts = [
+        format!("127.0.0.1:{}", port),
+        format!("localhost:{}", port),
+    ];
+
     for mut request in server.incoming_requests() {
-        match (request.method().as_str(), request.url()) {
+        let host_ok = request.headers().iter().any(|h| {
+            h.field.equiv("Host")
+                && allowed_hosts
+                    .iter()
+                    .any(|a| h.value.as_str().eq_ignore_ascii_case(a))
+        });
+        if !host_ok {
+            let _ = request.respond(
+                tiny_http::Response::from_string("Forbidden").with_status_code(403),
+            );
+            continue;
+        }
+
+        let url_path = request.url().to_string();
+        match (request.method().as_str(), url_path.as_str()) {
             ("GET", "/") => {
-                let response = tiny_http::Response::from_string(html.clone())
+                let response = tiny_http::Response::from_string(page.clone())
                     .with_header(html_header.clone());
                 let _ = request.respond(response);
             }
-            ("GET", "/draft") => {
+            ("GET", p) if p.starts_with("/img/") => {
+                let rest = &p["/img/".len()..];
+                let (idx_str, query) = rest.split_once('?').unwrap_or((rest, ""));
+                let token_ok = query
+                    .split('&')
+                    .any(|kv| kv.strip_prefix("t=").is_some_and(|v| v == token));
+
+                if !token_ok {
+                    let _ = request.respond(
+                        tiny_http::Response::from_string("Forbidden").with_status_code(403),
+                    );
+                    continue;
+                }
+
+                let file = idx_str.parse::<usize>().ok().and_then(|i| images.get(i));
+                match file.and_then(|path| fs::read(path).ok().map(|b| (path, b))) {
+                    Some((path, bytes)) => {
+                        let mime = tiny_http::Header::from_bytes(
+                            &b"Content-Type"[..],
+                            mime_for_path(path).as_bytes(),
+                        )
+                        .unwrap();
+                        let _ = request
+                            .respond(tiny_http::Response::from_data(bytes).with_header(mime));
+                    }
+                    None => {
+                        let _ = request.respond(
+                            tiny_http::Response::from_string("Not Found").with_status_code(404),
+                        );
+                    }
+                }
+            }
+            ("GET", "/draft") if has_token(&request) => {
                 let draft_path = cache_dir.join("draft_selection.json");
                 let draft = fs::read_to_string(&draft_path).unwrap_or_else(|_| "[]".into());
                 let response = tiny_http::Response::from_string(draft)
                     .with_header(json_header.clone());
                 let _ = request.respond(response);
             }
-            ("POST", "/autosave") => {
+            ("POST", "/autosave") if has_token(&request) => {
                 let mut content = String::new();
                 let _ = request.as_reader().read_to_string(&mut content);
                 let _ = fs::write(cache_dir.join("draft_selection.json"), &content);
                 let _ = request.respond(tiny_http::Response::from_string("OK"));
             }
-            ("POST", "/delete") => {
+            ("POST", "/delete") if has_token(&request) => {
                 let mut content = String::new();
                 request.as_reader().read_to_string(&mut content)?;
 
-                let paths: Vec<String> = serde_json::from_str(&content)
+                let mut paths: Vec<String> = serde_json::from_str(&content)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+                // Only paths that were actually shown in the review UI may be deleted.
+                let before = paths.len();
+                paths.retain(|p| allowed.contains(p));
+                if paths.len() != before {
+                    eprintln!(
+                        "  Warning: ignored {} path(s) not part of this session",
+                        before - paths.len()
+                    );
+                }
 
                 let _ = request.respond(tiny_http::Response::from_string("Success"));
 
                 // Clean up session files after successful delete
                 let _ = fs::remove_file(cache_dir.join("draft_selection.json"));
                 let _ = fs::remove_file(cache_dir.join("last_session.html"));
+                let _ = fs::remove_file(cache_dir.join("session_meta.json"));
 
                 return Ok(paths);
             }
-            ("POST", "/cancel") => {
+            ("POST", "/cancel") if has_token(&request) => {
                 let _ = request.respond(tiny_http::Response::from_string("Success"));
                 return Ok(vec![]);
             }
@@ -751,6 +929,25 @@ fn start_web_server(html: String) -> io::Result<Vec<String>> {
         }
     }
     Ok(vec![])
+}
+
+/// Load the saved --preview session (HTML + metadata) or exit with a message.
+fn load_saved_session() -> (String, HashSet<String>, Vec<String>) {
+    let session_path = dirs().join("last_session.html");
+    if !session_path.exists() {
+        eprintln!("No saved session found. Run with --preview first.");
+        std::process::exit(1);
+    }
+    let html = fs::read_to_string(&session_path).expect("Failed to read saved session");
+    let meta: SessionMeta = fs::read_to_string(dirs().join("session_meta.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| {
+            eprintln!("Saved session is from an older version and cannot be resumed safely.");
+            eprintln!("Re-run with --preview to start a fresh review.");
+            std::process::exit(1);
+        });
+    (html, meta.allowed.into_iter().collect(), meta.images)
 }
 
 fn open_in_browser(url: &str) {
@@ -782,7 +979,7 @@ fn print_usage(prog: &str) {
     eprintln!("Common options:");
     eprintln!("  --list-shares        List available root folder paths on the NAS, then exit");
     eprintln!("  --similar            Find visually similar pictures (using perceptual hashing)");
-    eprintln!("  --threshold <N>      Hamming distance threshold for --similar (default: 10, max: 64)");
+    eprintln!("  --threshold <N>      Hamming distance threshold for --similar (default: 10, max: 127)");
     eprintln!("  --delete             Delete duplicates (default: dry-run)");
     eprintln!("  --keep newest        Keep newest file per group (default: largest file)");
     eprintln!("  --keep oldest        Keep oldest file per group");
@@ -797,6 +994,8 @@ fn print_usage(prog: &str) {
     eprintln!("  --nas-user <USER>    DSM username (prompted if omitted)");
     eprintln!("  --nas-otp  <CODE>    6-digit OTP from Synology Secure SignIn app");
     eprintln!("                       (prompted interactively if omitted)");
+    eprintln!("  --insecure           Skip TLS certificate verification (needed for");
+    eprintln!("                       NAS devices using self-signed HTTPS certificates)");
     eprintln!("  Password is always prompted — never passed as a flag.");
     eprintln!();
     eprintln!("By default runs in dry-run mode. Review the output, then re-run with --delete.");
@@ -821,12 +1020,25 @@ fn main() {
     let list_shares = args.contains(&"--list-shares".to_string());
     let resume = args.contains(&"--resume".to_string());
     let clear_cache = args.contains(&"--clear-cache".to_string());
+    let insecure = args.contains(&"--insecure".to_string());
 
     if clear_cache {
-        let cache_file = dirs().join("hash_cache.json");
-        if cache_file.exists() {
-            let _ = fs::remove_file(&cache_file);
-            println!("Cache cleared.");
+        let cache_dir = dirs();
+        let mut removed = false;
+        // Hash cache plus any saved review session
+        for name in [
+            "hash_cache.json",
+            "draft_selection.json",
+            "last_session.html",
+            "session_meta.json",
+        ] {
+            let file = cache_dir.join(name);
+            if file.exists() && fs::remove_file(&file).is_ok() {
+                removed = true;
+            }
+        }
+        if removed {
+            println!("Cache and saved session cleared.");
         }
     }
 
@@ -841,18 +1053,22 @@ fn main() {
         std::process::exit(1);
     }
 
-    let threshold: u32 = args
+    let mut threshold: u32 = args
         .windows(2)
         .find(|w| w[0] == "--threshold")
         .map(|w| w[1].parse::<u32>().unwrap_or(DEFAULT_THRESHOLD))
         .unwrap_or(DEFAULT_THRESHOLD);
+    if threshold > 127 {
+        eprintln!("--threshold capped at 127 (the hash is 127 bits)");
+        threshold = 127;
+    }
 
     let nas_host = args.windows(2).find(|w| w[0] == "--nas-host").map(|w| w[1].clone());
     let nas_user = args.windows(2).find(|w| w[0] == "--nas-user").map(|w| w[1].clone());
     let nas_otp  = args.windows(2).find(|w| w[0] == "--nas-otp" ).map(|w| w[1].clone());
 
     if let Some(host) = nas_host {
-        run_nas(&path, &host, nas_user, nas_otp, delete, all_files, similar, preview, keep_strategy, list_shares, threshold, resume);
+        run_nas(&path, &host, nas_user, nas_otp, delete, all_files, similar, preview, keep_strategy, list_shares, threshold, resume, insecure);
     } else {
         run_local(&path, delete, all_files, similar, preview, keep_strategy, threshold, resume);
     }
@@ -863,14 +1079,9 @@ fn main() {
 fn run_local(root: &str, delete: bool, all_files: bool, similar: bool, preview: bool, keep_strategy: &str, threshold: u32, resume: bool) {
     // Resume a previous session
     if resume {
-        let session_path = dirs().join("last_session.html");
-        if !session_path.exists() {
-            eprintln!("No saved session found. Run with --preview first.");
-            std::process::exit(1);
-        }
-        let html = fs::read_to_string(&session_path).expect("Failed to read saved session");
+        let (html, allowed, images) = load_saved_session();
         println!("Resuming previous session...");
-        if let Ok(to_delete) = start_web_server(html) {
+        if let Ok(to_delete) = start_web_server(html, allowed, images) {
             if to_delete.is_empty() { 
                 println!("\n\x1b[1;31m👋 Session saved! The local web server has been shut down.\x1b[0m");
                 println!("\x1b[1;36mUse the --resume flag to restore your session and continue.\x1b[0m");
@@ -903,7 +1114,7 @@ fn run_local(root: &str, delete: bool, all_files: bool, similar: bool, preview: 
     println!("Scanned {} files", files.len());
 
     let (mut groups, errors) = if similar {
-        find_similar(files, |entry| {
+        find_similar(root, files, |entry| {
             if let FileSource::Local(path) = &entry.source {
                 compute_dhash_local(path)
             } else {
@@ -939,8 +1150,12 @@ fn run_local(root: &str, delete: bool, all_files: bool, similar: bool, preview: 
     print_report(&groups, total_del, total_bytes, delete);
 
     if preview {
-        let html = generate_html_preview(&groups, None);
-        if let Ok(to_delete) = start_web_server(html) {
+        let (html, images) = generate_html_preview(&groups, None);
+        let allowed: HashSet<String> = groups
+            .iter()
+            .flat_map(|g| g.iter().map(|e| e.display_path.clone()))
+            .collect();
+        if let Ok(to_delete) = start_web_server(html, allowed, images) {
             if to_delete.is_empty() {
                 println!("\n\x1b[1;31m👋 Session saved! The local web server has been shut down.\x1b[0m");
                 println!("\x1b[1;36mUse the --resume flag to restore your session and continue.\x1b[0m");
@@ -990,8 +1205,13 @@ fn run_nas(
     list_shares: bool,
     threshold: u32,
     resume: bool,
+    insecure: bool,
 ) {
     let base_url = nas::build_base_url(host);
+
+    if insecure {
+        eprintln!("⚠️  TLS certificate verification disabled (--insecure).");
+    }
 
     // Collect credentials — password is always prompted to keep it out of shell history
     let user = match nas_user {
@@ -1005,7 +1225,7 @@ fn run_nas(
         }
     };
 
-    let mut session_opt = nas::NasClient::try_restore_session(&base_url, &user);
+    let mut session_opt = nas::NasClient::try_restore_session(&base_url, &user, insecure);
     if session_opt.is_none() {
         let password = rpassword::prompt_password("NAS password: ")
             .expect("Failed to read password");
@@ -1022,16 +1242,22 @@ fn run_nas(
         };
 
         println!("\nConnecting : {}", base_url);
-        let s = match nas::NasClient::login(&base_url, &user, &password, &otp) {
+        let s = match nas::NasClient::login(&base_url, &user, &password, &otp, insecure) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("Authentication failed: {}", e);
                 std::process::exit(1);
             }
         };
-        
+
         let path = dirs().join("nas_session.txt");
         let _ = fs::write(&path, format!("{}|{}", user, s.sid));
+        // The session id grants access to the NAS — keep it private to this user.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        }
         session_opt = Some(s);
     } else {
         println!("\nResuming active NAS session for user '{}'...", user);
@@ -1043,15 +1269,9 @@ fn run_nas(
     println!();
 
     if resume {
-        let session_path = dirs().join("last_session.html");
-        if !session_path.exists() {
-            eprintln!("No saved session found. Run with --preview first.");
-            session.logout();
-            std::process::exit(1);
-        }
-        let html = fs::read_to_string(&session_path).expect("Failed to read saved session");
+        let (html, allowed, images) = load_saved_session();
         println!("Resuming previous NAS session...");
-        if let Ok(to_delete) = start_web_server(html) {
+        if let Ok(to_delete) = start_web_server(html, allowed, images) {
             if to_delete.is_empty() { 
                 println!("\n\x1b[1;31m👋 Session saved! The local web server has been shut down.\x1b[0m");
                 println!("\x1b[1;36mUse the --resume flag to restore your session and continue.\x1b[0m");
@@ -1114,7 +1334,7 @@ fn run_nas(
     println!("Scanned {} files", files.len());
 
     let (mut groups, errors) = if similar {
-        find_similar(files, |entry| {
+        find_similar(nas_path, files, |entry| {
             if let FileSource::Nas(p) = &entry.source {
                 compute_dhash_nas(&session, p)
             } else {
@@ -1152,8 +1372,12 @@ fn run_nas(
     print_report(&groups, total_del, total_bytes, delete);
 
     if preview {
-        let html = generate_html_preview(&groups, Some(&session));
-        if let Ok(to_delete) = start_web_server(html) {
+        let (html, images) = generate_html_preview(&groups, Some(&session));
+        let allowed: HashSet<String> = groups
+            .iter()
+            .flat_map(|g| g.iter().map(|e| e.display_path.clone()))
+            .collect();
+        if let Ok(to_delete) = start_web_server(html, allowed, images) {
             if to_delete.is_empty() {
                 println!("\n\x1b[1;31m👋 Session saved! The local web server has been shut down.\x1b[0m");
                 println!("\x1b[1;36mRun the command again with --resume to continue.\x1b[0m");
