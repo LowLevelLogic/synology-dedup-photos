@@ -69,6 +69,16 @@ pub struct NasClient {
     pub sid: String,
 }
 
+/// TLS certificates are verified by default; `insecure` opts out for NAS
+/// devices that only present a self-signed certificate.
+fn build_client(insecure: bool) -> reqwest::Result<reqwest::blocking::Client> {
+    let mut builder = reqwest::blocking::Client::builder().timeout(Duration::from_secs(30));
+    if insecure {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    builder.build()
+}
+
 fn auth_error(code: u32) -> String {
     match code {
         400 => "Invalid credentials".into(),
@@ -88,13 +98,9 @@ fn auth_error(code: u32) -> String {
 impl NasClient {
     /// Authenticate against Synology DSM and return a live session.
     /// `otp` may be empty if 2FA is not required.
-    pub fn login(base_url: &str, user: &str, pass: &str, otp: &str) -> Result<Self, String> {
-        let client = reqwest::blocking::Client::builder()
-            // Home NAS setups commonly use self-signed TLS certificates.
-            .danger_accept_invalid_certs(true)
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| e.to_string())?;
+    /// `insecure` disables TLS certificate verification (self-signed certs).
+    pub fn login(base_url: &str, user: &str, pass: &str, otp: &str, insecure: bool) -> Result<Self, String> {
+        let client = build_client(insecure).map_err(|e| e.to_string())?;
 
         let url = format!("{}/webapi/entry.cgi", base_url);
 
@@ -115,7 +121,15 @@ impl NasClient {
             .post(&url)
             .form(&form)
             .send()
-            .map_err(|e| format!("Could not reach NAS: {}", e))?
+            .map_err(|e| {
+                let mut msg = format!("Could not reach NAS: {}", e);
+                if !insecure {
+                    msg.push_str(
+                        "\nIf your NAS uses a self-signed HTTPS certificate, re-run with --insecure.",
+                    );
+                }
+                msg
+            })?
             .json()
             .map_err(|e| format!("Unexpected response from DSM: {}", e))?;
 
@@ -136,17 +150,13 @@ impl NasClient {
         })
     }
 
-    pub fn try_restore_session(base_url: &str, user: &str) -> Option<Self> {
+    pub fn try_restore_session(base_url: &str, user: &str, insecure: bool) -> Option<Self> {
         let path = crate::dirs().join("nas_session.txt");
         if let Ok(contents) = std::fs::read_to_string(&path) {
             let parts: Vec<&str> = contents.trim().split('|').collect();
             if parts.len() == 2 && parts[0] == user {
                 let sid = parts[1].to_string();
-                let client = reqwest::blocking::Client::builder()
-                    .danger_accept_invalid_certs(true)
-                    .timeout(std::time::Duration::from_secs(30))
-                    .build()
-                    .ok()?;
+                let client = build_client(insecure).ok()?;
 
                 let session = NasClient {
                     client,
