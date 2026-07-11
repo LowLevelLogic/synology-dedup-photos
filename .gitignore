@@ -1,2 +1,9 @@
 /target
 .DS_Store
+
+# Local test data & scratch analysis scripts
+/pics/
+analyze_cache.py
+analyze_dist.py
+extract_group.py
+apple-notes-export.zip
