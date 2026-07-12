@@ -1,4 +1,5 @@
 mod nas;
+mod semantic;
 
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -344,6 +345,197 @@ impl HashCache {
 pub fn dirs() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join(".cache").join("dedupPictures")
+}
+
+// ── Embedding Cache & Semantic Clustering ─────────────────────────────────────
+
+/// Default cosine-similarity threshold for --semantic (0..1). Calibrated on
+/// labeled retake groups: same-scene retakes scored 0.90-0.94 while photos of
+/// different scenes never exceeded 0.65, so 0.85 gives margin on both sides.
+const DEFAULT_SEMANTIC_THRESHOLD: f32 = 0.85;
+
+struct EmbedCache {
+    path: PathBuf,
+    entries: HashMap<String, String>, // cache_key -> base64(i8 quantised embedding)
+}
+
+impl EmbedCache {
+    fn load() -> Self {
+        let path = dirs().join("embed_cache.json");
+        let entries = if path.exists() {
+            fs::read_to_string(&path)
+                .ok()
+                .and_then(|data| serde_json::from_str(&data).ok())
+                .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+        EmbedCache { path, entries }
+    }
+
+    fn get(&self, entry: &FileEntry) -> Option<Vec<i8>> {
+        self.entries
+            .get(&HashCache::cache_key(entry))
+            .and_then(|s| semantic::dequantize(s))
+    }
+
+    fn insert(&mut self, entry: &FileEntry, emb: &[f32]) {
+        self.entries
+            .insert(HashCache::cache_key(entry), semantic::quantize(emb));
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn prune(&mut self, root: &str, current_keys: &HashSet<String>) -> usize {
+        let prefix = format!("{}/", root.trim_end_matches('/'));
+        let before = self.entries.len();
+        self.entries
+            .retain(|k, _| !k.starts_with(&prefix) || current_keys.contains(k));
+        before - self.entries.len()
+    }
+
+    fn save(&self) {
+        if let Some(parent) = self.path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(data) = serde_json::to_string(&self.entries) {
+            let _ = fs::write(&self.path, data);
+        }
+    }
+}
+
+/// Cluster images by CLIP embedding similarity. `bytes_fn` supplies the image
+/// bytes to embed (full file locally, NAS thumbnail in NAS mode).
+fn find_similar_semantic(
+    root: &str,
+    files: Vec<FileEntry>,
+    bytes_fn: impl Fn(&FileEntry) -> Option<Vec<u8>> + Sync,
+    threshold: f32,
+) -> (Vec<Vec<FileEntry>>, usize) {
+    let embedder = match semantic::Embedder::new() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Could not initialise the semantic model: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let n = files.len();
+    let mut cache = EmbedCache::load();
+    let current_keys: HashSet<String> = files.iter().map(HashCache::cache_key).collect();
+    let pruned = cache.prune(root, &current_keys);
+    let mut dirty = pruned > 0;
+
+    let mut embs: Vec<Option<Vec<i8>>> = vec![None; n];
+    let mut to_embed: Vec<usize> = Vec::new();
+    let mut cached_count = 0usize;
+
+    for (i, f) in files.iter().enumerate() {
+        if let Some(e) = cache.get(f) {
+            embs[i] = Some(e);
+            cached_count += 1;
+        } else {
+            to_embed.push(i);
+        }
+    }
+
+    if cached_count > 0 {
+        println!("  ⚡ {} embeddings loaded from cache", cached_count);
+    }
+
+    let mut errors = 0usize;
+    if !to_embed.is_empty() {
+        println!("  Embedding {} new files (CLIP vision model)...", to_embed.len());
+        let counter = AtomicUsize::new(0);
+        let total = to_embed.len();
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(16)
+            .build()
+            .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
+
+        let results: Vec<(usize, Option<Vec<f32>>)> = pool.install(|| {
+            to_embed
+                .par_iter()
+                .map(|&i| {
+                    let emb = bytes_fn(&files[i]).and_then(|b| embedder.embed(&b));
+                    let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done % 20 == 0 || done == total {
+                        eprint!("\r  Embedded {}/{} files", done, total);
+                    }
+                    (i, emb)
+                })
+                .collect()
+        });
+        eprintln!();
+
+        for (i, emb) in results {
+            match emb {
+                Some(e) => {
+                    cache.insert(&files[i], &e);
+                    embs[i] = cache.get(&files[i]);
+                }
+                None => errors += 1,
+            }
+        }
+        dirty = true;
+    }
+
+    if dirty {
+        cache.save();
+        println!("  Embedding cache saved ({} total entries)", cache.len());
+    }
+
+    println!(
+        "Clustering images by semantic similarity (threshold = {:.2})...",
+        threshold
+    );
+
+    let mut group_indices: Vec<Vec<usize>> = Vec::new();
+    let mut assigned = vec![false; n];
+
+    for i in 0..n {
+        if assigned[i] {
+            continue;
+        }
+        let e1 = match &embs[i] {
+            Some(e) => e,
+            None => continue,
+        };
+
+        let mut current_group = vec![i];
+
+        for j in (i + 1)..n {
+            if assigned[j] {
+                continue;
+            }
+            let e2 = match &embs[j] {
+                Some(e) => e,
+                None => continue,
+            };
+
+            // Compare strictly to the representative image to prevent chaining
+            if semantic::cosine_q(e1, e2) >= threshold {
+                current_group.push(j);
+                assigned[j] = true;
+            }
+        }
+
+        assigned[i] = true;
+        if current_group.len() > 1 {
+            group_indices.push(current_group);
+        }
+    }
+
+    let groups: Vec<Vec<FileEntry>> = group_indices
+        .into_iter()
+        .map(|indices| indices.into_iter().map(|i| files[i].clone()).collect())
+        .collect();
+
+    println!("Found {} groups of semantically similar images", groups.len());
+    (groups, errors)
 }
 
 // ── Core dedup pipeline ───────────────────────────────────────────────────────
@@ -980,6 +1172,11 @@ fn print_usage(prog: &str) {
     eprintln!("  --list-shares        List available root folder paths on the NAS, then exit");
     eprintln!("  --similar            Find visually similar pictures (using perceptual hashing)");
     eprintln!("  --threshold <N>      Hamming distance threshold for --similar (default: 10, max: 127)");
+    eprintln!("  --semantic           Find retakes/burst shots of the same scene using a local");
+    eprintln!("                       CLIP vision model (catches what --similar cannot: same");
+    eprintln!("                       scene shot from a slightly different angle)");
+    eprintln!("  --semantic-threshold <F>  Cosine similarity cutoff for --semantic, 0..1");
+    eprintln!("                       (default: {:.2}; lower = looser matching)", DEFAULT_SEMANTIC_THRESHOLD);
     eprintln!("  --delete             Delete duplicates (default: dry-run)");
     eprintln!("  --keep newest        Keep newest file per group (default: largest file)");
     eprintln!("  --keep oldest        Keep oldest file per group");
@@ -1016,6 +1213,7 @@ fn main() {
     let delete = args.contains(&"--delete".to_string());
     let all_files = args.contains(&"--all-files".to_string());
     let similar = args.contains(&"--similar".to_string());
+    let semantic = args.contains(&"--semantic".to_string());
     let preview = args.contains(&"--preview".to_string());
     let list_shares = args.contains(&"--list-shares".to_string());
     let resume = args.contains(&"--resume".to_string());
@@ -1028,6 +1226,7 @@ fn main() {
         // Hash cache plus any saved review session
         for name in [
             "hash_cache.json",
+            "embed_cache.json",
             "draft_selection.json",
             "last_session.html",
             "session_meta.json",
@@ -1063,20 +1262,27 @@ fn main() {
         threshold = 127;
     }
 
+    let semantic_threshold: f32 = args
+        .windows(2)
+        .find(|w| w[0] == "--semantic-threshold")
+        .map(|w| w[1].parse::<f32>().unwrap_or(DEFAULT_SEMANTIC_THRESHOLD))
+        .unwrap_or(DEFAULT_SEMANTIC_THRESHOLD)
+        .clamp(0.0, 1.0);
+
     let nas_host = args.windows(2).find(|w| w[0] == "--nas-host").map(|w| w[1].clone());
     let nas_user = args.windows(2).find(|w| w[0] == "--nas-user").map(|w| w[1].clone());
     let nas_otp  = args.windows(2).find(|w| w[0] == "--nas-otp" ).map(|w| w[1].clone());
 
     if let Some(host) = nas_host {
-        run_nas(&path, &host, nas_user, nas_otp, delete, all_files, similar, preview, keep_strategy, list_shares, threshold, resume, insecure);
+        run_nas(&path, &host, nas_user, nas_otp, delete, all_files, similar, preview, keep_strategy, list_shares, threshold, resume, insecure, semantic, semantic_threshold);
     } else {
-        run_local(&path, delete, all_files, similar, preview, keep_strategy, threshold, resume);
+        run_local(&path, delete, all_files, similar, preview, keep_strategy, threshold, resume, semantic, semantic_threshold);
     }
 }
 
 // ── Local mode ────────────────────────────────────────────────────────────────
 
-fn run_local(root: &str, delete: bool, all_files: bool, similar: bool, preview: bool, keep_strategy: &str, threshold: u32, resume: bool) {
+fn run_local(root: &str, delete: bool, all_files: bool, similar: bool, preview: bool, keep_strategy: &str, threshold: u32, resume: bool, semantic: bool, semantic_threshold: f32) {
     // Resume a previous session
     if resume {
         let (html, allowed, images) = load_saved_session();
@@ -1113,7 +1319,15 @@ fn run_local(root: &str, delete: bool, all_files: bool, similar: bool, preview: 
     let files = collect_local_files(root, all_files);
     println!("Scanned {} files", files.len());
 
-    let (mut groups, errors) = if similar {
+    let (mut groups, errors) = if semantic {
+        find_similar_semantic(root, files, |entry| {
+            if let FileSource::Local(path) = &entry.source {
+                fs::read(path).ok()
+            } else {
+                None
+            }
+        }, semantic_threshold)
+    } else if similar {
         find_similar(root, files, |entry| {
             if let FileSource::Local(path) = &entry.source {
                 compute_dhash_local(path)
@@ -1206,6 +1420,8 @@ fn run_nas(
     threshold: u32,
     resume: bool,
     insecure: bool,
+    semantic: bool,
+    semantic_threshold: f32,
 ) {
     let base_url = nas::build_base_url(host);
 
@@ -1333,7 +1549,17 @@ fn run_nas(
 
     println!("Scanned {} files", files.len());
 
-    let (mut groups, errors) = if similar {
+    let (mut groups, errors) = if semantic {
+        // Synology "medium" thumbnails (~240px) carry enough detail for the
+        // model's 224x224 input without downloading original photos.
+        find_similar_semantic(nas_path, files, |entry| {
+            if let FileSource::Nas(p) = &entry.source {
+                session.thumbnail_bytes(p, "medium").map(|(_, b)| b)
+            } else {
+                None
+            }
+        }, semantic_threshold)
+    } else if similar {
         find_similar(nas_path, files, |entry| {
             if let FileSource::Nas(p) = &entry.source {
                 compute_dhash_nas(&session, p)
