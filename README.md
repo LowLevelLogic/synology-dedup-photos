@@ -7,6 +7,7 @@ It features a beautiful interactive web-based dashboard for reviewing and confir
 ## Features ✨
 
 * **127-bit Dual-Gradient Perceptual Hashing:** Don't just find exact byte-for-byte duplicates. `dedupPictures` uses a custom 127-bit perceptual hash (tracking both horizontal and vertical gradients) to find photos that *look* the same, even if one was resized, compressed, or sent over WhatsApp.
+* **AI Retake Detection (`--semantic`):** Perceptual hashes can't catch *retakes* — two presses of the shutter seconds (or minutes) apart with the camera moved slightly, which look identical to a human but share almost no pixel layout. The `--semantic` mode runs every photo through a local CLIP vision model (a one-time ~88 MB download, all inference on your machine — nothing leaves your computer) and groups photos by *what's in them* instead of where the pixels sit. In NAS mode it embeds the small server-generated thumbnails, so it stays just as bandwidth-friendly.
 * **Synology NAS Native Architecture:** Most standard photo deduplication tools require you to mount your NAS as a network drive (SMB) and will download the *entire* 50MB+ Raw file for every single photo over your Wi-Fi just to analyze it, choking your network and taking hours. `dedupPictures` talks directly to the Synology DSM `FileStation` APIs. Instead of downloading the original photos, it asks the NAS to generate a tiny 10KB thumbnail and analyzes that instead. This allows it to perceptually scan terabytes of network photos in mere seconds.
 * **MFA / 2FA Support:** Fully supports Synology Secure SignIn / Multi-Factor Authentication. If you don't have MFA enabled on your NAS account, simply hit Enter when prompted—it works seamlessly with or without it.
 * **Interactive Web Dashboard:** Creates a stunning, glassmorphic dark-mode web dashboard on a local server (`http://127.0.0.1:8080` by default; a free port is picked automatically if 8080 is busy) where you can visually click and toggle which images to Keep or Delete. The server is protected by a per-run security token, and it will only ever delete files that were actually shown in the review session.
@@ -45,6 +46,13 @@ Point it at a local directory on your machine:
 ```bash
 cargo run --release -- /Users/name/Pictures --preview
 ```
+
+### Finding Retakes & Burst Shots
+Classic perceptual hashing (`--similar`) finds *copies* of the same shot (recompressed, resized, WhatsApp-ed). It cannot find *retakes* — you pressed the shutter twice and moved the camera an inch. For those, use the semantic mode (works in both Local and NAS mode):
+```bash
+cargo run --release -- /Users/name/Pictures --semantic --preview
+```
+Retakes are different photos, so review the groups in the UI before deleting — the auto-selected "keep" is just the largest file, which isn't necessarily the best shot of the burst.
 
 ### Generic NAS Mode (QNAP, TrueNAS, Unraid, etc.)
 Because generic network protocols (like WebDAV or SMB) don't have standardized ways to ask the NAS to generate and send tiny thumbnails, building a dedicated network API for them would force the script to download full 10MB+ Raw files over your Wi-Fi, defeating the purpose of a fast network deduplicator. 
@@ -108,6 +116,8 @@ This will restore your active session and re-open the browser with all of your c
 |---|---|
 | `--similar` | Finds visually similar pictures (using perceptual hashing) instead of exact byte-for-byte duplicates. Highly recommended for photo libraries. |
 | `--threshold <N>` | The Hamming distance threshold for `--similar`. Default is `10` (out of 127 bits). Set lower (e.g. `5`) to be extremely strict (exact duplicates/burst shots), set higher (e.g. `20`) to catch heavier compressions and resizes. |
+| `--semantic` | Finds **retakes and burst shots** — photos of the same scene taken moments apart from a slightly different angle — using a local CLIP vision model. Use this when `--similar` misses photos that look obviously identical to you. First run downloads the model (~88 MB, one-time); embeddings are cached so re-runs are fast. |
+| `--semantic-threshold <F>` | Cosine similarity cutoff for `--semantic` (0..1, default `0.85`). In calibration, true retakes scored 0.90+ while unrelated photos stayed below 0.65 — lower the value to match more aggressively, raise it if you see false positives. |
 | `--preview` | Opens the interactive visual web report in your browser for manual review. |
 | `--resume` | Resumes a previous `--preview` session. Picks up your auto-saved KEEP/DELETE selections exactly where you left off. |
 | `--keep <strategy>` | Determines which file in a duplicate group is marked to KEEP by default. Options: `largest` (default, good for keeping original high-res over compressed copies), `newest`, `oldest`. |

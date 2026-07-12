@@ -14,3 +14,4 @@ base64 = "0.22"
 image = "0.25.10"
 tiny_http = "0.12.0"
 rayon = "1.12.0"
+ort = { version = "2.0.0-rc.10", features = ["download-binaries"] }
