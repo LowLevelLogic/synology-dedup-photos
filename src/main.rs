@@ -866,24 +866,6 @@ fn generate_html_preview(
   }).catch(() => {});
 
   document.getElementById('submitBtn').addEventListener('click', async () => {
-    // Safety check: Ensure no group has 0 "KEEP" cards
-    const groups = document.querySelectorAll('.group');
-    for (let i = 0; i < groups.length; i++) {
-      const group = groups[i];
-      const keepCards = group.querySelectorAll('.card.keep');
-      if (keepCards.length === 0) {
-        const title = group.querySelector('.group-title').textContent.split('(')[0].trim();
-        alert(`🚨 Safety Check Failed:\n\n${title} has NO pictures selected to keep (all photos are marked for deletion).\n\nPlease click one of the photos in that group to mark it as 'KEEP' before proceeding.`);
-        
-        // Scroll the problematic group into view and flash it
-        group.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        const originalBg = group.style.backgroundColor;
-        group.style.backgroundColor = 'rgba(239, 68, 68, 0.2)';
-        setTimeout(() => { group.style.backgroundColor = originalBg; }, 2000);
-        return;
-      }
-    }
-
     const toDelete = Array.from(document.querySelectorAll('.card.del')).map(c => c.dataset.path);
     if (!confirm(`Are you absolutely sure you want to permanently delete ${toDelete.length} files? This cannot be undone.`)) return;
     
