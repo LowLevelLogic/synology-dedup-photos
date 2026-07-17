@@ -1449,7 +1449,11 @@ fn run_nas(
         };
 
         let path = dirs().join("nas_session.txt");
-        let _ = fs::write(&path, format!("{}|{}", user, s.sid));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = fs::write(&path, format!("{}|{}|{}", user, s.sid, now));
         // The session id grants access to the NAS — keep it private to this user.
         #[cfg(unix)]
         {
