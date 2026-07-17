@@ -63,6 +63,10 @@ struct NasFileTime {
 
 // ── NasClient ─────────────────────────────────────────────────────────────────
 
+/// A saved session older than this forces a fresh password/OTP login,
+/// regardless of how long DSM itself would keep the sid alive.
+const SESSION_MAX_AGE_SECS: u64 = 60 * 60;
+
 pub struct NasClient {
     client: reqwest::blocking::Client,
     base_url: String,
@@ -154,7 +158,33 @@ impl NasClient {
         let path = crate::dirs().join("nas_session.txt");
         if let Ok(contents) = std::fs::read_to_string(&path) {
             let parts: Vec<&str> = contents.trim().split('|').collect();
-            if parts.len() == 2 && parts[0] == user {
+            if parts.len() != 3 {
+                // Pre-timestamp file format — no way to age-check it, treat as expired.
+                let _ = std::fs::remove_file(&path);
+                return None;
+            }
+            if parts[0] == user {
+                let saved_at = parts[2].parse::<u64>().unwrap_or(0);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+
+                if now.saturating_sub(saved_at) > SESSION_MAX_AGE_SECS {
+                    // Kill the stale session server-side before forgetting it locally.
+                    if let Ok(client) = build_client(insecure) {
+                        let stale = NasClient {
+                            client,
+                            base_url: base_url.to_string(),
+                            sid: parts[1].to_string(),
+                        };
+                        stale.logout();
+                    }
+                    let _ = std::fs::remove_file(&path);
+                    eprintln!("Saved NAS session expired (older than 60 min) — please log in again.");
+                    return None;
+                }
+
                 let sid = parts[1].to_string();
                 let client = build_client(insecure).ok()?;
 
