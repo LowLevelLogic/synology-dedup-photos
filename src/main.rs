@@ -1488,6 +1488,10 @@ fn run_local(root: &str, delete: bool, all_files: bool, similar: bool, preview: 
             .iter()
             .flat_map(|g| g.iter().map(|e| e.display_path.clone()))
             .collect();
+        // A draft belongs to the session that wrote it. A leftover draft from
+        // an earlier scan (Save & Exit) would override this scan's KEEP/DELETE
+        // defaults on load — only --resume may inherit it.
+        let _ = fs::remove_file(dirs().join("draft_selection.json"));
         if let Ok(to_delete) = start_web_server(html, allowed, images) {
             if to_delete.is_empty() {
                 println!("\n\x1b[1;31m👋 Session saved! The local web server has been shut down.\x1b[0m");
@@ -1722,6 +1726,10 @@ fn run_nas(
             .iter()
             .flat_map(|g| g.iter().map(|e| e.display_path.clone()))
             .collect();
+        // A draft belongs to the session that wrote it. A leftover draft from
+        // an earlier scan (Save & Exit) would override this scan's KEEP/DELETE
+        // defaults on load — only --resume may inherit it.
+        let _ = fs::remove_file(dirs().join("draft_selection.json"));
         if let Ok(to_delete) = start_web_server(html, allowed, images) {
             if to_delete.is_empty() {
                 println!("\n\x1b[1;31m👋 Session saved! The local web server has been shut down.\x1b[0m");
