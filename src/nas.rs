@@ -1,4 +1,3 @@
-use base64::{engine::general_purpose, Engine as _};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::io::Read;
@@ -71,6 +70,9 @@ pub struct NasClient {
     client: reqwest::blocking::Client,
     base_url: String,
     pub sid: String,
+    /// Account this session authenticated as; keys the on-disk thumbnail
+    /// cache so one account's previews are never served to another.
+    pub user: String,
 }
 
 /// TLS certificates are verified by default; `insecure` opts out for NAS
@@ -151,6 +153,7 @@ impl NasClient {
             client,
             base_url: base_url.to_string(),
             sid,
+            user: user.to_string(),
         })
     }
 
@@ -177,6 +180,7 @@ impl NasClient {
                             client,
                             base_url: base_url.to_string(),
                             sid: parts[1].to_string(),
+                            user: user.to_string(),
                         };
                         stale.logout();
                     }
@@ -192,6 +196,7 @@ impl NasClient {
                     client,
                     base_url: base_url.to_string(),
                     sid: sid.clone(),
+                    user: user.to_string(),
                 };
 
                 // Validate the session
@@ -411,14 +416,6 @@ impl NasClient {
         }
 
         Some((ct, bytes.to_vec()))
-    }
-
-    /// Fetch a thumbnail from the NAS and return a base64 data URI,
-    /// or `None` if the thumbnail is unavailable.
-    pub fn thumbnail_data_uri(&self, nas_path: &str) -> Option<String> {
-        self.thumbnail_bytes(nas_path, "large").map(|(ct, bytes)| {
-            format!("data:{};base64,{}", ct, general_purpose::STANDARD.encode(&bytes))
-        })
     }
 
     /// Delete files on the NAS via the FileStation Delete API.
