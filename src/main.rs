@@ -651,8 +651,118 @@ fn html_escape(s: &str) -> String {
 /// Placeholder replaced with a per-run CSRF token when the page is served.
 const TOKEN_PLACEHOLDER: &str = "__CSRF_TOKEN__";
 
-/// Returns the page HTML (with token placeholders) plus the list of local
-/// image paths referenced by `/img/<index>` routes.
+// ── NAS thumbnail disk cache ─────────────────────────────────────────────────
+// Preview thumbnails are cached under ~/.cache/dedupPictures/thumbs/<user>/
+// and served through the token-checked /img/<idx> route instead of being
+// base64-inlined into the page (which held every thumbnail in memory at once
+// and OOM-killed large scans). Cached previews mean neither review nor
+// --resume needs a live NAS session to display images.
+
+/// Cached NAS thumbnails expire after this long; a preview should not
+/// outlive the review window it was fetched for.
+const NAS_THUMB_MAX_AGE_SECS: u64 = 72 * 60 * 60;
+
+/// Extensions a cached thumbnail may be stored under, per the DSM-reported
+/// content type (jpg in practice).
+const NAS_THUMB_EXTS: &[&str] = &["jpg", "png", "gif", "webp"];
+
+/// Per-NAS-account thumbnail cache directory. Segregated by account so no
+/// serving path can cross users; hex-digest filenames mean no NAS- or
+/// client-controlled path component ever reaches the filesystem.
+fn nas_thumb_dir(user: &str) -> PathBuf {
+    let safe: String = user
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    dirs().join("thumbs").join(safe)
+}
+
+fn nas_thumb_digest(entry: &FileEntry) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(HashCache::cache_key(entry).as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Existing cache file for this entry's thumbnail, if any. Keyed by the
+/// shared `path:size:mtime` cache-key contract, so any change to the photo
+/// on the NAS is an automatic miss.
+fn find_cached_nas_thumb(user: &str, entry: &FileEntry) -> Option<PathBuf> {
+    let dir = nas_thumb_dir(user);
+    let digest = nas_thumb_digest(entry);
+    NAS_THUMB_EXTS
+        .iter()
+        .map(|ext| dir.join(format!("{}.{}", digest, ext)))
+        .find(|p| p.exists())
+}
+
+/// Cache file for a NAS entry's "large" preview thumbnail, fetching from the
+/// NAS on a miss. `None` = the NAS could not provide a thumbnail.
+fn cached_nas_thumbnail(
+    session: &nas::NasClient,
+    entry: &FileEntry,
+    nas_path: &str,
+) -> Option<PathBuf> {
+    if let Some(existing) = find_cached_nas_thumb(&session.user, entry) {
+        return Some(existing);
+    }
+
+    let (ct, bytes) = session.thumbnail_bytes(nas_path, "large")?;
+    let ext = match ct.as_str() {
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "jpg",
+    };
+
+    let dir = nas_thumb_dir(&session.user);
+    fs::create_dir_all(&dir).ok()?;
+    let file = dir.join(format!("{}.{}", nas_thumb_digest(entry), ext));
+    fs::write(&file, &bytes).ok()?;
+    // Previews of NAS-permission-protected photos — keep them private to
+    // this OS user, like nas_session.txt.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(dirs().join("thumbs"), fs::Permissions::from_mode(0o700));
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+        let _ = fs::set_permissions(&file, fs::Permissions::from_mode(0o600));
+    }
+    Some(file)
+}
+
+/// Remove the cached thumbnail of a file that was deleted from the NAS —
+/// it can never be re-reviewed.
+fn remove_cached_nas_thumb(user: &str, entry: &FileEntry) {
+    if let Some(file) = find_cached_nas_thumb(user, entry) {
+        let _ = fs::remove_file(file);
+    }
+}
+
+/// Drop cached thumbnails older than the expiry, across all accounts. Runs
+/// every invocation so previews expire even if NAS mode is never used again.
+fn prune_nas_thumbs() {
+    let root = dirs().join("thumbs");
+    let now = std::time::SystemTime::now();
+    let Ok(users) = fs::read_dir(&root) else { return };
+    for user_dir in users.flatten() {
+        let Ok(files) = fs::read_dir(user_dir.path()) else { continue };
+        for f in files.flatten() {
+            let expired = f
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| now.duration_since(t).ok())
+                .is_some_and(|age| age.as_secs() > NAS_THUMB_MAX_AGE_SECS);
+            if expired {
+                let _ = fs::remove_file(f.path());
+            }
+        }
+    }
+}
+
+/// Returns the page HTML (with token placeholders) plus the list of image
+/// files referenced by `/img/<index>` routes — local originals in local
+/// mode, cached thumbnail files in NAS mode.
 fn generate_html_preview(
     groups: &[Vec<FileEntry>],
     nas: Option<&nas::NasClient>,
@@ -762,8 +872,15 @@ fn generate_html_preview(
                         );
                         io::stdout().flush().ok();
                     }
-                    match nas.and_then(|s| s.thumbnail_data_uri(nas_path)) {
-                        Some(uri) => format!(r#"<img src="{}" alt="">"#, uri),
+                    match nas.and_then(|s| cached_nas_thumbnail(s, entry, nas_path)) {
+                        Some(cache_file) => {
+                            let idx = images.len();
+                            images.push(cache_file.display().to_string());
+                            format!(
+                                r#"<img src="/img/{}?t={}" alt="" loading="lazy">"#,
+                                idx, TOKEN_PLACEHOLDER
+                            )
+                        }
                         None => format!(
                             r#"<div class="no-preview">{} — no preview</div>"#,
                             html_escape(&entry.ext.to_uppercase())
@@ -960,7 +1077,8 @@ fn mime_for_path(path: &str) -> &'static str {
 
 /// `allowed` is the set of paths the server may be asked to delete (everything
 /// shown in the review UI); anything else in a /delete request is rejected.
-/// `images` are the local files served via /img/<index>.
+/// `images` are the files served via /img/<index> (local originals or cached
+/// NAS thumbnails).
 fn start_web_server(
     html_template: String,
     allowed: HashSet<String>,
@@ -1231,10 +1349,16 @@ fn main() {
                 removed = true;
             }
         }
+        let thumbs = cache_dir.join("thumbs");
+        if thumbs.exists() && fs::remove_dir_all(&thumbs).is_ok() {
+            removed = true;
+        }
         if removed {
             println!("Cache and saved session cleared.");
         }
     }
+
+    prune_nas_thumbs();
 
     let keep_strategy = args
         .windows(2)
@@ -1621,6 +1745,22 @@ fn run_nas(
             for (p, e) in &failures {
                 eprintln!("  Error: {} — {}", p, e);
             }
+
+            // Deleted photos can never be re-reviewed; drop their cached
+            // thumbnails now instead of waiting out the 72 h expiry.
+            let deleted_ok: std::collections::HashSet<&str> = to_delete
+                .iter()
+                .map(|s| s.as_str())
+                .filter(|p| !failed.contains(p))
+                .collect();
+            for entry in groups.iter().flatten() {
+                if let FileSource::Nas(p) = &entry.source {
+                    if deleted_ok.contains(p.as_str()) {
+                        remove_cached_nas_thumb(&session.user, entry);
+                    }
+                }
+            }
+
             println!("Done. Deleted {} files ({} errors).", deleted, errs);
         }
     } else if delete {
@@ -1655,6 +1795,16 @@ fn run_nas(
             }
             for (p, e) in &failures {
                 eprintln!("  Error: {} — {}", p, e);
+            }
+
+            // Drop cached thumbnails of anything just deleted (they may
+            // exist from an earlier --preview run of the same scan).
+            for entry in group.iter().skip(1) {
+                if let FileSource::Nas(p) = &entry.source {
+                    if !failed.contains(p.as_str()) {
+                        remove_cached_nas_thumb(&session.user, entry);
+                    }
+                }
             }
         }
 
