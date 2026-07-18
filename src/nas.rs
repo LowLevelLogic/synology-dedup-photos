@@ -200,23 +200,10 @@ impl NasClient {
                 };
 
                 // Validate the session
-                let url = format!("{}/webapi/entry.cgi", base_url);
-                if let Ok(resp) = session.client.get(&url)
-                    .query(&[
-                        ("api", "SYNO.FileStation.Info"),
-                        ("version", "2"),
-                        ("method", "get"),
-                        ("_sid", &sid),
-                    ])
-                    .send() {
-                    
-                    if let Ok(json) = resp.json::<serde_json::Value>() {
-                        if json.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
-                            return Some(session);
-                        }
-                    }
+                if session.is_alive() {
+                    return Some(session);
                 }
-                
+
                 let _ = std::fs::remove_file(&path);
             }
         }
@@ -377,6 +364,24 @@ impl NasClient {
         }
 
         Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    /// Cheap server-side check that this session's sid is still accepted.
+    pub fn is_alive(&self) -> bool {
+        let url = format!("{}/webapi/entry.cgi", self.base_url);
+        self.client
+            .get(&url)
+            .query(&[
+                ("api", "SYNO.FileStation.Info"),
+                ("version", "2"),
+                ("method", "get"),
+                ("_sid", &self.sid),
+            ])
+            .send()
+            .ok()
+            .and_then(|r| r.json::<serde_json::Value>().ok())
+            .and_then(|j| j.get("success").and_then(|v| v.as_bool()))
+            .unwrap_or(false)
     }
 
     pub fn thumbnail_bytes(&self, nas_path: &str, size: &str) -> Option<(String, Vec<u8>)> {
