@@ -1511,7 +1511,6 @@ fn run_nas(
             }
             println!("Done. Deleted {} files ({} errors).", deleted, errs);
         }
-        session.logout();
         return;
     }
 
@@ -1528,7 +1527,6 @@ fn run_nas(
             }
             Err(e) => eprintln!("Failed to list shares: {}", e),
         }
-        session.logout();
         return;
     }
 
@@ -1541,7 +1539,6 @@ fn run_nas(
         Ok(f) => f,
         Err(e) => {
             eprintln!("Failed to list files: {}", e);
-            session.logout();
             std::process::exit(1);
         }
     };
@@ -1588,7 +1585,6 @@ fn run_nas(
     }
     if groups.is_empty() {
         println!("\nNo duplicates found.");
-        session.logout();
         return;
     }
 
@@ -1666,5 +1662,6 @@ fn run_nas(
         println!("Done. Deleted {} files ({} errors).", deleted, errs);
     }
 
-    session.logout();
+    // No logout: the session is saved in nas_session.txt for reuse and stays
+    // valid until the 60-minute expiry in try_restore_session revokes it.
 }
