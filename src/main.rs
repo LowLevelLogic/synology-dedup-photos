@@ -712,8 +712,15 @@ fn generate_html_preview(
 
     html = html.replace("{GROUPS}", &groups.len().to_string());
 
-    if nas.is_some() {
-        print!("Fetching NAS thumbnails");
+    const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let nas_total = groups
+        .iter()
+        .flatten()
+        .filter(|e| matches!(e.source, FileSource::Nas(_)))
+        .count();
+    let mut nas_done = 0usize;
+    if nas.is_some() && nas_total > 0 {
+        print!("{} Fetching NAS thumbnails 0/{}", SPINNER[0], nas_total);
         io::stdout().flush().ok();
     }
 
@@ -746,7 +753,13 @@ fn generate_html_preview(
                 }
                 FileSource::Nas(nas_path) => {
                     if nas.is_some() {
-                        print!(".");
+                        nas_done += 1;
+                        print!(
+                            "\r{} Fetching NAS thumbnails {}/{}",
+                            SPINNER[nas_done % SPINNER.len()],
+                            nas_done,
+                            nas_total
+                        );
                         io::stdout().flush().ok();
                     }
                     match nas.and_then(|s| s.thumbnail_data_uri(nas_path)) {
@@ -791,8 +804,8 @@ fn generate_html_preview(
         html.push_str("</div></div>\n");
     }
 
-    if nas.is_some() {
-        println!(" done");
+    if nas.is_some() && nas_total > 0 {
+        println!("\r✓ Fetching NAS thumbnails {}/{} done", nas_done, nas_total);
     }
 
     html.push_str(
