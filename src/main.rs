@@ -1,8 +1,11 @@
 mod nas;
 mod semantic;
 
+use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
+use aes_gcm::{Aes256Gcm, Nonce};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use zeroize::Zeroizing;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -657,14 +660,153 @@ const TOKEN_PLACEHOLDER: &str = "__CSRF_TOKEN__";
 // base64-inlined into the page (which held every thumbnail in memory at once
 // and OOM-killed large scans). Cached previews mean neither review nor
 // --resume needs a live NAS session to display images.
+//
+// Every cached file is AES-256-GCM encrypted under a key derived from the
+// user's NAS password (Argon2id, per-user random salt). The key exists only
+// in process memory and dies with the process; nothing on disk can decrypt
+// the cache. Serving refreshes a file's mtime, so expiry counts from last
+// *use* — an active multi-day review keeps its own cache alive while an
+// abandoned one ages out.
 
-/// Cached NAS thumbnails expire after this long; a preview should not
-/// outlive the review window it was fetched for.
-const NAS_THUMB_MAX_AGE_SECS: u64 = 72 * 60 * 60;
+/// Cached NAS thumbnails expire this long after last use. At-rest they are
+/// ciphertext, so this is housekeeping plus a bound on how long material is
+/// exposed to offline password guessing — not the primary privacy control.
+const NAS_THUMB_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// Extensions a cached thumbnail may be stored under, per the DSM-reported
-/// content type (jpg in practice).
+/// content type (jpg in practice). On disk each becomes `<digest>.<ext>.enc`.
 const NAS_THUMB_EXTS: &[&str] = &["jpg", "png", "gif", "webp"];
+
+/// Magic prefix of an encrypted thumbnail file: magic ‖ 12-byte nonce ‖ ct.
+const THUMB_MAGIC: &[u8] = b"DPT1";
+
+/// Known plaintext encrypted into `.canary` when a user's cache is first
+/// keyed; lets a later run verify a typed password *before* trusting the
+/// derived key (inside the sid-restore window DSM never checks it).
+const THUMB_CANARY: &[u8] = b"dedupPictures thumbnail canary v1";
+
+/// Thumbnail-cache key. Zeroized on drop; never written to disk.
+type ThumbKey = Zeroizing<[u8; 32]>;
+
+fn derive_thumb_key(password: &str, salt: &[u8]) -> Option<ThumbKey> {
+    let mut key = Zeroizing::new([0u8; 32]);
+    argon2::Argon2::default()
+        .hash_password_into(password.as_bytes(), salt, key.as_mut())
+        .ok()?;
+    Some(key)
+}
+
+/// Per-user random salt, created on first use (0600).
+fn load_or_create_salt(dir: &Path) -> Option<[u8; 16]> {
+    let path = dir.join(".salt");
+    if let Ok(bytes) = fs::read(&path) {
+        if bytes.len() == 16 {
+            return Some(bytes.try_into().ok()?);
+        }
+    }
+    let mut salt = [0u8; 16];
+    use aes_gcm::aead::rand_core::RngCore;
+    OsRng.fill_bytes(&mut salt);
+    fs::create_dir_all(dir).ok()?;
+    fs::write(&path, salt).ok()?;
+    set_private_perms(&path, false);
+    Some(salt)
+}
+
+fn encrypt_thumb(key: &ThumbKey, plain: &[u8]) -> Option<Vec<u8>> {
+    let cipher = Aes256Gcm::new_from_slice(key.as_ref()).ok()?;
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let ct = cipher.encrypt(&nonce, plain).ok()?;
+    let mut out = Vec::with_capacity(THUMB_MAGIC.len() + nonce.len() + ct.len());
+    out.extend_from_slice(THUMB_MAGIC);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    Some(out)
+}
+
+/// GCM's auth tag makes this fail deterministically under a wrong key.
+fn decrypt_thumb(key: &ThumbKey, data: &[u8]) -> Option<Vec<u8>> {
+    let rest = data.strip_prefix(THUMB_MAGIC)?;
+    if rest.len() < 12 {
+        return None;
+    }
+    let (nonce, ct) = rest.split_at(12);
+    let cipher = Aes256Gcm::new_from_slice(key.as_ref()).ok()?;
+    cipher.decrypt(Nonce::from_slice(nonce), ct).ok()
+}
+
+fn set_private_perms(path: &Path, is_dir: bool) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if is_dir { 0o700 } else { 0o600 };
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+    }
+    #[cfg(not(unix))]
+    let _ = (path, is_dir);
+}
+
+/// Derive and canary-verify the cache key for `user`. `password` is the
+/// DSM-verified password when a full login just happened; None means the
+/// sid-restore path skipped the prompt and we must ask (password only — the
+/// saved sid already covers authentication, so no OTP).
+///
+/// Canary mismatch = typo, or the NAS password changed since the cache was
+/// written. After three failed tries the user may discard the cache and
+/// re-key it (thumbnails re-fetch on the next scan).
+fn obtain_thumb_key(user: &str, password: Option<&str>) -> Option<ThumbKey> {
+    let dir = nas_thumb_dir(user);
+    let salt = load_or_create_salt(&dir)?;
+    let canary_path = dir.join(".canary");
+
+    let mut attempt = 0;
+    loop {
+        let pw: Zeroizing<String> = match (password, attempt) {
+            (Some(p), 0) => Zeroizing::new(p.to_string()),
+            _ => Zeroizing::new(
+                rpassword::prompt_password("NAS password (unlocks thumbnail cache): ").ok()?,
+            ),
+        };
+        let key = derive_thumb_key(&pw, &salt)?;
+
+        match fs::read(&canary_path) {
+            Ok(canary) => {
+                if decrypt_thumb(&key, &canary).as_deref() == Some(THUMB_CANARY) {
+                    return Some(key);
+                }
+                attempt += 1;
+                if attempt < 3 {
+                    eprintln!("Password does not match the thumbnail cache key — try again.");
+                    continue;
+                }
+                eprint!(
+                    "Still no match (did the NAS password change?). \
+                     Discard the cached thumbnails and re-key? [y/N]: "
+                );
+                io::stderr().flush().ok();
+                let mut answer = String::new();
+                io::stdin().read_line(&mut answer).ok()?;
+                if answer.trim().eq_ignore_ascii_case("y") {
+                    let _ = fs::remove_dir_all(&dir);
+                    let salt = load_or_create_salt(&dir)?;
+                    let key = derive_thumb_key(&pw, &salt)?;
+                    let sealed = encrypt_thumb(&key, THUMB_CANARY)?;
+                    fs::write(&canary_path, sealed).ok()?;
+                    set_private_perms(&canary_path, false);
+                    return Some(key);
+                }
+                return None;
+            }
+            Err(_) => {
+                // First use for this account: seal the canary now.
+                let sealed = encrypt_thumb(&key, THUMB_CANARY)?;
+                fs::write(&canary_path, sealed).ok()?;
+                set_private_perms(&canary_path, false);
+                return Some(key);
+            }
+        }
+    }
+}
 
 /// Per-NAS-account thumbnail cache directory. Segregated by account so no
 /// serving path can cross users; hex-digest filenames mean no NAS- or
@@ -691,14 +833,16 @@ fn find_cached_nas_thumb(user: &str, entry: &FileEntry) -> Option<PathBuf> {
     let digest = nas_thumb_digest(entry);
     NAS_THUMB_EXTS
         .iter()
-        .map(|ext| dir.join(format!("{}.{}", digest, ext)))
+        .map(|ext| dir.join(format!("{}.{}.enc", digest, ext)))
         .find(|p| p.exists())
 }
 
-/// Cache file for a NAS entry's "large" preview thumbnail, fetching from the
-/// NAS on a miss. `None` = the NAS could not provide a thumbnail.
+/// Cache file for a NAS entry's "large" preview thumbnail (encrypted with
+/// `key`), fetching from the NAS on a miss. `None` = the NAS could not
+/// provide a thumbnail.
 fn cached_nas_thumbnail(
     session: &nas::NasClient,
+    key: &ThumbKey,
     entry: &FileEntry,
     nas_path: &str,
 ) -> Option<PathBuf> {
@@ -716,17 +860,12 @@ fn cached_nas_thumbnail(
 
     let dir = nas_thumb_dir(&session.user);
     fs::create_dir_all(&dir).ok()?;
-    let file = dir.join(format!("{}.{}", nas_thumb_digest(entry), ext));
-    fs::write(&file, &bytes).ok()?;
-    // Previews of NAS-permission-protected photos — keep them private to
-    // this OS user, like nas_session.txt.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(dirs().join("thumbs"), fs::Permissions::from_mode(0o700));
-        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
-        let _ = fs::set_permissions(&file, fs::Permissions::from_mode(0o600));
-    }
+    let file = dir.join(format!("{}.{}.enc", nas_thumb_digest(entry), ext));
+    fs::write(&file, encrypt_thumb(key, &bytes)?).ok()?;
+    // Defense in depth on top of the encryption, like nas_session.txt.
+    set_private_perms(&dirs().join("thumbs"), true);
+    set_private_perms(&dir, true);
+    set_private_perms(&file, false);
     Some(file)
 }
 
@@ -747,6 +886,11 @@ fn prune_nas_thumbs() {
     for user_dir in users.flatten() {
         let Ok(files) = fs::read_dir(user_dir.path()) else { continue };
         for f in files.flatten() {
+            // Only thumbnail ciphertext expires; .salt/.canary must outlive
+            // it or the surviving cache files become undecryptable.
+            if !f.file_name().to_string_lossy().ends_with(".enc") {
+                continue;
+            }
             let expired = f
                 .metadata()
                 .and_then(|m| m.modified())
@@ -766,6 +910,7 @@ fn prune_nas_thumbs() {
 fn generate_html_preview(
     groups: &[Vec<FileEntry>],
     nas: Option<&nas::NasClient>,
+    thumb_key: Option<&ThumbKey>,
 ) -> (String, Vec<String>) {
     let mut html = String::new();
     let mut images: Vec<String> = Vec::new();
@@ -872,7 +1017,10 @@ fn generate_html_preview(
                         );
                         io::stdout().flush().ok();
                     }
-                    match nas.and_then(|s| cached_nas_thumbnail(s, entry, nas_path)) {
+                    match nas
+                        .zip(thumb_key)
+                        .and_then(|(s, k)| cached_nas_thumbnail(s, k, entry, nas_path))
+                    {
                         Some(cache_file) => {
                             let idx = images.len();
                             images.push(cache_file.display().to_string());
@@ -1083,6 +1231,7 @@ fn start_web_server(
     html_template: String,
     allowed: HashSet<String>,
     images: Vec<String>,
+    thumb_key: Option<ThumbKey>,
 ) -> io::Result<Vec<String>> {
     let cache_dir = dirs();
     let _ = fs::create_dir_all(&cache_dir);
@@ -1168,11 +1317,25 @@ fn start_web_server(
                 }
 
                 let file = idx_str.parse::<usize>().ok().and_then(|i| images.get(i));
-                match file.and_then(|path| fs::read(path).ok().map(|b| (path, b))) {
-                    Some((path, bytes)) => {
+                let served = file.and_then(|path| {
+                    let bytes = fs::read(path).ok()?;
+                    if let Some(stripped) = path.strip_suffix(".enc") {
+                        // Encrypted NAS thumbnail: decrypt in memory, and
+                        // refresh mtime so expiry counts from last use.
+                        let plain = decrypt_thumb(thumb_key.as_ref()?, &bytes)?;
+                        if let Ok(f) = fs::File::options().write(true).open(path) {
+                            let _ = f.set_modified(std::time::SystemTime::now());
+                        }
+                        Some((stripped.to_string(), plain))
+                    } else {
+                        Some((path.clone(), bytes))
+                    }
+                });
+                match served {
+                    Some((mime_path, bytes)) => {
                         let mime = tiny_http::Header::from_bytes(
                             &b"Content-Type"[..],
-                            mime_for_path(path).as_bytes(),
+                            mime_for_path(&mime_path).as_bytes(),
                         )
                         .unwrap();
                         let _ = request
@@ -1406,7 +1569,7 @@ fn run_local(root: &str, delete: bool, all_files: bool, similar: bool, preview: 
     if resume {
         let (html, allowed, images) = load_saved_session();
         println!("Resuming previous session...");
-        if let Ok(to_delete) = start_web_server(html, allowed, images) {
+        if let Ok(to_delete) = start_web_server(html, allowed, images, None) {
             if to_delete.is_empty() { 
                 println!("\n\x1b[1;31m👋 Session saved! The local web server has been shut down.\x1b[0m");
                 println!("\x1b[1;36mUse the --resume flag to restore your session and continue.\x1b[0m");
@@ -1483,7 +1646,7 @@ fn run_local(root: &str, delete: bool, all_files: bool, similar: bool, preview: 
     print_report(&groups, total_del, total_bytes, delete);
 
     if preview {
-        let (html, images) = generate_html_preview(&groups, None);
+        let (html, images) = generate_html_preview(&groups, None, None);
         let allowed: HashSet<String> = groups
             .iter()
             .flat_map(|g| g.iter().map(|e| e.display_path.clone()))
@@ -1492,7 +1655,7 @@ fn run_local(root: &str, delete: bool, all_files: bool, similar: bool, preview: 
         // an earlier scan (Save & Exit) would override this scan's KEEP/DELETE
         // defaults on load — only --resume may inherit it.
         let _ = fs::remove_file(dirs().join("draft_selection.json"));
-        if let Ok(to_delete) = start_web_server(html, allowed, images) {
+        if let Ok(to_delete) = start_web_server(html, allowed, images, None) {
             if to_delete.is_empty() {
                 println!("\n\x1b[1;31m👋 Session saved! The local web server has been shut down.\x1b[0m");
                 println!("\x1b[1;36mUse the --resume flag to restore your session and continue.\x1b[0m");
@@ -1528,6 +1691,55 @@ fn run_local(root: &str, delete: bool, all_files: bool, similar: bool, preview: 
 }
 
 // ── NAS mode ──────────────────────────────────────────────────────────────────
+
+/// Persist the sid for the 60-minute reuse window (0600 — it is a live
+/// NAS credential).
+fn save_nas_session_file(user: &str, sid: &str) {
+    let path = dirs().join("nas_session.txt");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = fs::write(&path, format!("{}|{}|{}", user, sid, now));
+    set_private_perms(&path, false);
+}
+
+/// DSM may expire a sid server-side while a long review sits open. Deletion
+/// is the only step that still needs the NAS, so re-authenticate just before
+/// it rather than failing every file. Returns false if the user aborts or
+/// login fails.
+fn ensure_nas_session_alive(
+    session: &mut nas::NasClient,
+    base_url: &str,
+    user: &str,
+    insecure: bool,
+) -> bool {
+    if session.is_alive() {
+        return true;
+    }
+    eprintln!("\nNAS session expired while you were reviewing — please re-authenticate to delete.");
+    let Ok(password) = rpassword::prompt_password("NAS password: ") else {
+        return false;
+    };
+    let password = Zeroizing::new(password);
+    eprint!("OTP code (from Synology Secure SignIn app, or Enter to skip): ");
+    io::stderr().flush().ok();
+    let mut otp = String::new();
+    if io::stdin().read_line(&mut otp).is_err() {
+        return false;
+    }
+    match nas::NasClient::login(base_url, user, &password, otp.trim(), insecure) {
+        Ok(s) => {
+            save_nas_session_file(user, &s.sid);
+            *session = s;
+            true
+        }
+        Err(e) => {
+            eprintln!("Authentication failed: {}", e);
+            false
+        }
+    }
+}
 
 fn run_nas(
     nas_path: &str,
@@ -1565,6 +1777,9 @@ fn run_nas(
     };
 
     let mut session_opt = nas::NasClient::try_restore_session(&base_url, &user, insecure);
+    // Kept (in memory only) so the thumbnail-cache key can be derived without
+    // prompting twice; the sid-restore path leaves it None and prompts later.
+    let mut full_login_password: Option<Zeroizing<String>> = None;
     if session_opt.is_none() {
         let password = rpassword::prompt_password("NAS password: ")
             .expect("Failed to read password");
@@ -1589,38 +1804,47 @@ fn run_nas(
             }
         };
 
-        let path = dirs().join("nas_session.txt");
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let _ = fs::write(&path, format!("{}|{}|{}", user, s.sid, now));
-        // The session id grants access to the NAS — keep it private to this user.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-        }
+        save_nas_session_file(&user, &s.sid);
+        full_login_password = Some(Zeroizing::new(password));
         session_opt = Some(s);
     } else {
         println!("\nResuming active NAS session for user '{}'...", user);
     }
 
-    let session = session_opt.unwrap();
+    let mut session = session_opt.unwrap();
 
     println!("Authenticated");
     println!();
 
+    // Preview generation and serving need the in-memory cache key; other
+    // runs (exact scan, --delete without preview, --list-shares) do not.
+    let thumb_key = if preview || resume {
+        match obtain_thumb_key(&user, full_login_password.as_deref().map(|s| s.as_str())) {
+            Some(k) => Some(k),
+            None => {
+                eprintln!("Cannot unlock the thumbnail cache without the password.");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+    drop(full_login_password);
+
     if resume {
         let (html, allowed, images) = load_saved_session();
         println!("Resuming previous NAS session...");
-        if let Ok(to_delete) = start_web_server(html, allowed, images) {
-            if to_delete.is_empty() { 
+        if let Ok(to_delete) = start_web_server(html, allowed, images, thumb_key) {
+            if to_delete.is_empty() {
                 println!("\n\x1b[1;31m👋 Session saved! The local web server has been shut down.\x1b[0m");
                 println!("\x1b[1;36mUse the --resume flag to restore your session and continue.\x1b[0m");
-                return; 
+                return;
             }
             println!("\nDeleting {} files from NAS via UI request...", to_delete.len());
+            if !ensure_nas_session_alive(&mut session, &base_url, &user, insecure) {
+                eprintln!("Deletion aborted — the NAS session could not be re-established.");
+                return;
+            }
             let (mut deleted, mut errs) = (0usize, 0usize);
 
             let failures = session.delete_files(&to_delete.iter().map(|s| s.as_str()).collect::<Vec<_>>());
@@ -1721,7 +1945,7 @@ fn run_nas(
     print_report(&groups, total_del, total_bytes, delete);
 
     if preview {
-        let (html, images) = generate_html_preview(&groups, Some(&session));
+        let (html, images) = generate_html_preview(&groups, Some(&session), thumb_key.as_ref());
         let allowed: HashSet<String> = groups
             .iter()
             .flat_map(|g| g.iter().map(|e| e.display_path.clone()))
@@ -1730,13 +1954,17 @@ fn run_nas(
         // an earlier scan (Save & Exit) would override this scan's KEEP/DELETE
         // defaults on load — only --resume may inherit it.
         let _ = fs::remove_file(dirs().join("draft_selection.json"));
-        if let Ok(to_delete) = start_web_server(html, allowed, images) {
+        if let Ok(to_delete) = start_web_server(html, allowed, images, thumb_key) {
             if to_delete.is_empty() {
                 println!("\n\x1b[1;31m👋 Session saved! The local web server has been shut down.\x1b[0m");
                 println!("\x1b[1;36mRun the command again with --resume to continue.\x1b[0m");
                 return;
             }
             println!("\nDeleting {} files from NAS via UI request...", to_delete.len());
+            if !ensure_nas_session_alive(&mut session, &base_url, &user, insecure) {
+                eprintln!("Deletion aborted — the NAS session could not be re-established.");
+                return;
+            }
             let (mut deleted, mut errs) = (0usize, 0usize);
 
             let failures = session.delete_files(&to_delete.iter().map(|s| s.as_str()).collect::<Vec<_>>());
@@ -1774,6 +2002,10 @@ fn run_nas(
     } else if delete {
         println!();
         println!("Deleting from NAS...");
+        if !ensure_nas_session_alive(&mut session, &base_url, &user, insecure) {
+            eprintln!("Deletion aborted — the NAS session could not be re-established.");
+            return;
+        }
         let (mut deleted, mut errs) = (0usize, 0usize);
 
         for group in &groups {
