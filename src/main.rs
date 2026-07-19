@@ -808,15 +808,58 @@ fn obtain_thumb_key(user: &str, password: Option<&str>) -> Option<ThumbKey> {
     }
 }
 
+/// Filesystem-safe form of an account name for per-user subdirectories.
+fn sanitize_user(user: &str) -> String {
+    user.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect()
+}
+
 /// Per-NAS-account thumbnail cache directory. Segregated by account so no
 /// serving path can cross users; hex-digest filenames mean no NAS- or
 /// client-controlled path component ever reaches the filesystem.
 fn nas_thumb_dir(user: &str) -> PathBuf {
-    let safe: String = user
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-        .collect();
-    dirs().join("thumbs").join(safe)
+    dirs().join("thumbs").join(sanitize_user(user))
+}
+
+/// Per-user session-state directory: saved review session, draft selections,
+/// the DSM sid, and the event log. Segregated so concurrent reviewers on one
+/// machine can't overwrite (or resume, or delete from) each other's sessions.
+/// Local mode uses the fixed "local" slot.
+fn session_dir(user: &str) -> PathBuf {
+    dirs().join("sessions").join(sanitize_user(user))
+}
+
+/// Ensure a session dir exists with private perms (0700 like `thumbs/`).
+fn ensure_session_dir(dir: &Path) {
+    let _ = fs::create_dir_all(dir);
+    set_private_perms(&dirs().join("sessions"), true);
+    set_private_perms(dir, true);
+}
+
+/// Location of a user's saved DSM sid (also read by `nas.rs`).
+pub fn nas_session_file(user: &str) -> PathBuf {
+    session_dir(user).join("nas_session.txt")
+}
+
+/// Append a lifecycle event (timestamped) to the user's `events.jsonl` so
+/// external tooling (e.g. the homelab launcher) can track session status and
+/// history. Best-effort: logging never interrupts a run.
+fn log_session_event(session_dir: &Path, mut record: serde_json::Value) {
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Some(obj) = record.as_object_mut() {
+        obj.insert("ts".to_string(), serde_json::json!(now));
+    }
+    ensure_session_dir(session_dir);
+    let path = session_dir.join("events.jsonl");
+    if let Ok(mut f) = fs::File::options().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{}", record);
+        drop(f);
+        set_private_perms(&path, false);
+    }
 }
 
 fn nas_thumb_digest(entry: &FileEntry) -> String {
@@ -1232,9 +1275,10 @@ fn start_web_server(
     allowed: HashSet<String>,
     images: Vec<String>,
     thumb_key: Option<ThumbKey>,
+    session_dir: &Path,
 ) -> io::Result<Vec<String>> {
-    let cache_dir = dirs();
-    let _ = fs::create_dir_all(&cache_dir);
+    let cache_dir = session_dir.to_path_buf();
+    ensure_session_dir(&cache_dir);
 
     // Save session (token placeholders intact) for --resume
     let _ = fs::write(cache_dir.join("last_session.html"), &html_template);
@@ -1245,6 +1289,10 @@ fn start_web_server(
     if let Ok(json) = serde_json::to_string(&meta) {
         let _ = fs::write(cache_dir.join("session_meta.json"), json);
     }
+    log_session_event(
+        &cache_dir,
+        serde_json::json!({"event": "review_started", "files": allowed.len()}),
+    );
 
     let token = generate_token();
     let page = html_template.replace(TOKEN_PLACEHOLDER, &token);
@@ -1389,6 +1437,7 @@ fn start_web_server(
             }
             ("POST", "/cancel") if has_token(&request) => {
                 let _ = request.respond(tiny_http::Response::from_string("Success"));
+                log_session_event(&cache_dir, serde_json::json!({"event": "save_exit"}));
                 return Ok(vec![]);
             }
             _ => {
@@ -1400,14 +1449,14 @@ fn start_web_server(
 }
 
 /// Load the saved --preview session (HTML + metadata) or exit with a message.
-fn load_saved_session() -> (String, HashSet<String>, Vec<String>) {
-    let session_path = dirs().join("last_session.html");
+fn load_saved_session(session_dir: &Path) -> (String, HashSet<String>, Vec<String>) {
+    let session_path = session_dir.join("last_session.html");
     if !session_path.exists() {
         eprintln!("No saved session found. Run with --preview first.");
         std::process::exit(1);
     }
     let html = fs::read_to_string(&session_path).expect("Failed to read saved session");
-    let meta: SessionMeta = fs::read_to_string(dirs().join("session_meta.json"))
+    let meta: SessionMeta = fs::read_to_string(session_dir.join("session_meta.json"))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| {
@@ -1516,9 +1565,37 @@ fn main() {
         if thumbs.exists() && fs::remove_dir_all(&thumbs).is_ok() {
             removed = true;
         }
+        // Per-user session state — everything except nas_session.txt, which
+        // --clear-cache has never touched (it would log the user out).
+        if let Ok(users) = fs::read_dir(cache_dir.join("sessions")) {
+            for user_dir in users.flatten() {
+                let Ok(files) = fs::read_dir(user_dir.path()) else { continue };
+                for f in files.flatten() {
+                    if f.file_name() != "nas_session.txt" && fs::remove_file(f.path()).is_ok() {
+                        removed = true;
+                    }
+                }
+            }
+        }
         if removed {
             println!("Cache and saved session cleared.");
         }
+    }
+
+    // One-time migration: pre-multi-user layouts kept a single sid at the
+    // cache root. Move it into its owner's session dir so the sid reuse
+    // window survives the upgrade instead of forcing a full re-login.
+    let legacy_sid = dirs().join("nas_session.txt");
+    if let Ok(contents) = fs::read_to_string(&legacy_sid) {
+        if let Some(user) = contents.trim().split('|').next().filter(|u| !u.is_empty()) {
+            let dest = nas_session_file(user);
+            if let Some(dir) = dest.parent() {
+                ensure_session_dir(dir);
+            }
+            let _ = fs::write(&dest, contents.trim());
+            set_private_perms(&dest, false);
+        }
+        let _ = fs::remove_file(&legacy_sid);
     }
 
     prune_nas_thumbs();
@@ -1565,24 +1642,31 @@ fn main() {
 // ── Local mode ────────────────────────────────────────────────────────────────
 
 fn run_local(root: &str, delete: bool, all_files: bool, similar: bool, preview: bool, keep_strategy: &str, threshold: u32, resume: bool, semantic: bool, semantic_threshold: f32) {
+    let sdir = session_dir("local");
+
     // Resume a previous session
     if resume {
-        let (html, allowed, images) = load_saved_session();
+        let (html, allowed, images) = load_saved_session(&sdir);
         println!("Resuming previous session...");
-        if let Ok(to_delete) = start_web_server(html, allowed, images, None) {
-            if to_delete.is_empty() { 
+        if let Ok(to_delete) = start_web_server(html, allowed, images, None, &sdir) {
+            if to_delete.is_empty() {
                 println!("\n\x1b[1;31m👋 Session saved! The local web server has been shut down.\x1b[0m");
                 println!("\x1b[1;36mUse the --resume flag to restore your session and continue.\x1b[0m");
-                return; 
+                return;
             }
             println!("\nDeleting {} files...", to_delete.len());
             let (mut deleted, mut errs) = (0usize, 0usize);
+            let mut freed: u64 = 0;
             for path_str in to_delete {
+                let size = fs::metadata(&path_str).map(|m| m.len()).unwrap_or(0);
                 match fs::remove_file(&path_str) {
-                    Ok(_) => { println!("  Deleted: {}", path_str); deleted += 1; }
+                    Ok(_) => { println!("  Deleted: {}", path_str); deleted += 1; freed += size; }
                     Err(e) => { eprintln!("  Error: {} \u{2014} {}", path_str, e); errs += 1; }
                 }
             }
+            log_session_event(&sdir, serde_json::json!({
+                "event": "delete_completed", "deleted": deleted, "errors": errs, "freed_bytes": freed,
+            }));
             println!("Done. Deleted {} files ({} errors).", deleted, errs);
         }
         return;
@@ -1654,8 +1738,8 @@ fn run_local(root: &str, delete: bool, all_files: bool, similar: bool, preview: 
         // A draft belongs to the session that wrote it. A leftover draft from
         // an earlier scan (Save & Exit) would override this scan's KEEP/DELETE
         // defaults on load — only --resume may inherit it.
-        let _ = fs::remove_file(dirs().join("draft_selection.json"));
-        if let Ok(to_delete) = start_web_server(html, allowed, images, None) {
+        let _ = fs::remove_file(sdir.join("draft_selection.json"));
+        if let Ok(to_delete) = start_web_server(html, allowed, images, None, &sdir) {
             if to_delete.is_empty() {
                 println!("\n\x1b[1;31m👋 Session saved! The local web server has been shut down.\x1b[0m");
                 println!("\x1b[1;36mUse the --resume flag to restore your session and continue.\x1b[0m");
@@ -1663,12 +1747,17 @@ fn run_local(root: &str, delete: bool, all_files: bool, similar: bool, preview: 
             }
             println!("\nDeleting {} files from UI request...", to_delete.len());
             let (mut deleted, mut errs) = (0usize, 0usize);
+            let mut freed: u64 = 0;
             for path_str in to_delete {
+                let size = fs::metadata(&path_str).map(|m| m.len()).unwrap_or(0);
                 match fs::remove_file(&path_str) {
-                    Ok(_) => { println!("  Deleted: {}", path_str); deleted += 1; }
+                    Ok(_) => { println!("  Deleted: {}", path_str); deleted += 1; freed += size; }
                     Err(e) => { eprintln!("  Error: {} — {}", path_str, e); errs += 1; }
                 }
             }
+            log_session_event(&sdir, serde_json::json!({
+                "event": "delete_completed", "deleted": deleted, "errors": errs, "freed_bytes": freed,
+            }));
             println!("Done. Deleted {} files ({} errors).", deleted, errs);
         }
     } else if delete {
@@ -1695,7 +1784,10 @@ fn run_local(root: &str, delete: bool, all_files: bool, similar: bool, preview: 
 /// Persist the sid for the 60-minute reuse window (0600 — it is a live
 /// NAS credential).
 fn save_nas_session_file(user: &str, sid: &str) {
-    let path = dirs().join("nas_session.txt");
+    let path = nas_session_file(user);
+    if let Some(dir) = path.parent() {
+        ensure_session_dir(dir);
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1831,10 +1923,12 @@ fn run_nas(
     };
     drop(full_login_password);
 
+    let sdir = session_dir(&user);
+
     if resume {
-        let (html, allowed, images) = load_saved_session();
+        let (html, allowed, images) = load_saved_session(&sdir);
         println!("Resuming previous NAS session...");
-        if let Ok(to_delete) = start_web_server(html, allowed, images, thumb_key) {
+        if let Ok(to_delete) = start_web_server(html, allowed, images, thumb_key, &sdir) {
             if to_delete.is_empty() {
                 println!("\n\x1b[1;31m👋 Session saved! The local web server has been shut down.\x1b[0m");
                 println!("\x1b[1;36mUse the --resume flag to restore your session and continue.\x1b[0m");
@@ -1861,6 +1955,10 @@ fn run_nas(
             for (p, e) in &failures {
                 eprintln!("  Error: {} — {}", p, e);
             }
+            // No sizes here — the resumed session's meta has paths only.
+            log_session_event(&sdir, serde_json::json!({
+                "event": "delete_completed", "deleted": deleted, "errors": errs,
+            }));
             println!("Done. Deleted {} files ({} errors).", deleted, errs);
         }
         return;
@@ -1953,8 +2051,8 @@ fn run_nas(
         // A draft belongs to the session that wrote it. A leftover draft from
         // an earlier scan (Save & Exit) would override this scan's KEEP/DELETE
         // defaults on load — only --resume may inherit it.
-        let _ = fs::remove_file(dirs().join("draft_selection.json"));
-        if let Ok(to_delete) = start_web_server(html, allowed, images, thumb_key) {
+        let _ = fs::remove_file(sdir.join("draft_selection.json"));
+        if let Ok(to_delete) = start_web_server(html, allowed, images, thumb_key, &sdir) {
             if to_delete.is_empty() {
                 println!("\n\x1b[1;31m👋 Session saved! The local web server has been shut down.\x1b[0m");
                 println!("\x1b[1;36mRun the command again with --resume to continue.\x1b[0m");
@@ -1983,19 +2081,24 @@ fn run_nas(
             }
 
             // Deleted photos can never be re-reviewed; drop their cached
-            // thumbnails now instead of waiting out the 72 h expiry.
+            // thumbnails now instead of waiting out the 30-day expiry.
             let deleted_ok: std::collections::HashSet<&str> = to_delete
                 .iter()
                 .map(|s| s.as_str())
                 .filter(|p| !failed.contains(p))
                 .collect();
+            let mut freed: u64 = 0;
             for entry in groups.iter().flatten() {
                 if let FileSource::Nas(p) = &entry.source {
                     if deleted_ok.contains(p.as_str()) {
+                        freed += entry.size;
                         remove_cached_nas_thumb(&session.user, entry);
                     }
                 }
             }
+            log_session_event(&sdir, serde_json::json!({
+                "event": "delete_completed", "deleted": deleted, "errors": errs, "freed_bytes": freed,
+            }));
 
             println!("Done. Deleted {} files ({} errors).", deleted, errs);
         }
