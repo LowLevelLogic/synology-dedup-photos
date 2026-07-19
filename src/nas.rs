@@ -158,7 +158,7 @@ impl NasClient {
     }
 
     pub fn try_restore_session(base_url: &str, user: &str, insecure: bool) -> Option<Self> {
-        let path = crate::dirs().join("nas_session.txt");
+        let path = crate::nas_session_file(user);
         if let Ok(contents) = std::fs::read_to_string(&path) {
             let parts: Vec<&str> = contents.trim().split('|').collect();
             if parts.len() != 3 {
